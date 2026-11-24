@@ -75,6 +75,11 @@ The script writes its temporary init SQL into a unique per-run directory with
 restricted ACLs and removes the file after use. Passwords are never passed as
 command-line arguments or written to the audit log.
 
+After a reset, cancellation, or failure, the result stays visible until you
+press Enter. A service that was stopped before the reset remains stopped; start
+it in Services before connecting. For scripted runs, pass `-NoWait` to return
+without waiting for a key press. Read-only preflight never waits.
+
 ## Tests
 
 Run the local regression checks with:

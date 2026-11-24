@@ -477,7 +477,38 @@ Write-Output 'PASS: UAC handoff waits for the elevated process.'
 Write-Output 'PASS: pre-reset service state is tracked.'
 Write-Output 'PASS: non-admin staging and read-only preflight are available.'
 
-$script:appVersion = '1.1.0'
+$waitResultFunction = $functions['Wait-ForResult']
+if (-not $waitResultFunction) {
+    throw 'Interactive reset results must remain visible until the user acknowledges them.'
+}
+$waitResultCases = @(
+    @{ NoWait = '$false'; Preflight = '$false'; ExpectedPrompts = 1 },
+    @{ NoWait = '$true'; Preflight = '$false'; ExpectedPrompts = 0 },
+    @{ NoWait = '$false'; Preflight = '$true'; ExpectedPrompts = 0 }
+)
+foreach ($waitCase in $waitResultCases) {
+    $global:waitResultPromptCount = 0
+    $waitResultTest = [scriptblock]::Create(
+        $waitResultFunction.Extent.Text +
+        "`nfunction Read-Host { `$global:waitResultPromptCount++; return '' }" +
+        "`n`$NoWait = $($waitCase.NoWait); `$Preflight = $($waitCase.Preflight); Wait-ForResult"
+    )
+    & $waitResultTest
+    if ($global:waitResultPromptCount -ne $waitCase.ExpectedPrompts) {
+        throw 'Reset results must wait for acknowledgment except in preflight or explicit no-wait mode.'
+    }
+}
+if ($functions['Fail-WithReport'].Extent.Text -notmatch '\bWait-ForResult\b' -or
+    ([regex]::Matches($powerShellSource, '(?m)^\s*Wait-ForResult\s*$')).Count -lt 3) {
+    throw 'Failure, cancellation, and success outcomes must all keep the result visible.'
+}
+if ($powerShellSource -notmatch '\[switch\]\$NoWait' -or
+    $powerShellSource -notmatch 'if \(\$NoWait\) \{ \$argList \+= "-NoWait" \}') {
+    throw 'The no-wait option must also be preserved across the UAC handoff.'
+}
+Write-Output 'PASS: reset outcomes stay visible and automation can explicitly skip waiting.'
+
+$script:appVersion = '1.1.1'
 $uiFormFunction = [scriptblock]::Create($functions['New-MySqlUpdateForm'].Extent.Text)
 . $uiFormFunction
 $previewInfo = [pscustomobject]@{ Version = '1.2.0' }

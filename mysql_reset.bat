@@ -39,7 +39,8 @@ param(
     [string]$LogDir = "$env:ProgramData\MySQLPasswordReset",
     [switch]$Elevated,
     [switch]$Preflight,
-    [switch]$SkipUpdateCheck
+    [switch]$SkipUpdateCheck,
+    [switch]$NoWait
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,7 +54,7 @@ $script:tempProcess = $null
 $serviceStopped = $false
 $serviceWasRunning = $false
 $script:plainPass = $null
-$script:appVersion = "1.1.0"
+$script:appVersion = "1.1.1"
 $dbPort = 3306
 $svcAccount = $null
 
@@ -64,6 +65,13 @@ function Write-Log {
     Write-Host $line
     if ($script:loggingEnabled) {
         Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 -ErrorAction Stop
+    }
+}
+
+function Wait-ForResult {
+    if (-not $NoWait -and -not $Preflight) {
+        Write-Host ""
+        [void](Read-Host "Press Enter to close this window")
     }
 }
 
@@ -725,6 +733,7 @@ function Fail-WithReport {
     }
 
     Write-Host "======================================================================" -ForegroundColor Red
+    Wait-ForResult
     exit $ExitCode
 }
 
@@ -781,6 +790,7 @@ if (-not $isAdmin -and -not $Preflight) {
         if ($ServiceName) { $argList += @("-ServiceName", "`"$ServiceName`"") }
         if ($MySqlBin) { $argList += @("-MySqlBin", "`"$MySqlBin`"") }
         if ($DefaultsFile) { $argList += @("-DefaultsFile", "`"$DefaultsFile`"") }
+        if ($NoWait) { $argList += "-NoWait" }
 
         $elevatedProcess = Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs -Wait -PassThru -ErrorAction Stop
         exit $elevatedProcess.ExitCode
@@ -973,8 +983,9 @@ while ($true) {
 
 $confirm = Read-Host "Stop '$ServiceName' and reset root password now? [Y/N]"
 if ($confirm -notmatch '^[Yy]$') {
-    Write-Log "[ABORT] Cancelled by user."
+    Write-Log "[ABORT] Cancelled by user. No password changes were made."
     $script:plainPass = $null
+    Wait-ForResult
     exit 0
 }
 
@@ -1087,8 +1098,12 @@ try {
     Write-Host "======================================================================" -ForegroundColor Green
     Write-Host "[SUCCESS] Password reset completed for root@localhost." -ForegroundColor Green
     Write-Host "Service   : $ServiceName ($finalServiceStatus)"
+    if (-not $serviceWasRunning) {
+        Write-Host "Note      : The service was already stopped and remains stopped. Start it in Services before connecting."
+    }
     Write-Host "Audit Log : $logFile"
     Write-Host "======================================================================" -ForegroundColor Green
+    Wait-ForResult
     exit 0
 } catch {
     Fail-WithReport -Step "Step 9: Start Service & Verify Login" -ExitCode 1 -Reason $_.Exception.Message -Fix "Check Windows Application Event Log and MySQL .err log, then start '$ServiceName'."

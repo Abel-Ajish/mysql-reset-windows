@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.1 - 2026-11-24
+
+### Fixed
+
+- Keep reset success, cancellation, and failure results visible until
+  acknowledged instead of closing the console immediately.
+- Explain when the MySQL service remains stopped because it was stopped before
+  the reset, and add a no-wait option for scripted runs.
+
 ## 1.1.0 - 2026-11-24
 
 ### Added
