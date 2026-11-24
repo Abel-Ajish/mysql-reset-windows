@@ -23,6 +23,17 @@ if ($parseErrors.Count -gt 0) {
     throw "Embedded PowerShell has parse errors: $($parseErrors -join '; ')"
 }
 
+$appVersionMatch = [regex]::Match($powerShellSource, '(?m)^\$script:appVersion = "(\d+\.\d+\.\d+)"\s*$')
+$changelogPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'CHANGELOG.md'
+$changelog = [IO.File]::ReadAllText($changelogPath)
+$changelogVersionMatch = [regex]::Match($changelog, '(?m)^## (\d+\.\d+\.\d+) - ')
+if (-not $appVersionMatch.Success -or
+    -not $changelogVersionMatch.Success -or
+    $appVersionMatch.Groups[1].Value -cne $changelogVersionMatch.Groups[1].Value) {
+    throw 'The embedded launcher version must match the latest changelog version.'
+}
+$appVersion = $appVersionMatch.Groups[1].Value
+
 $functions = @{}
 $ast.FindAll({
     param($node)
@@ -531,7 +542,7 @@ if ($powerShellSource -notmatch '\[switch\]\$NoWait' -or
 }
 Write-Output 'PASS: reset outcomes stay visible and automation can explicitly skip waiting.'
 
-$script:appVersion = '1.1.2'
+$script:appVersion = $appVersion
 $uiFormFunction = [scriptblock]::Create($functions['New-MySqlUpdateForm'].Extent.Text)
 . $uiFormFunction
 $previewInfo = [pscustomobject]@{ Version = '1.2.0' }

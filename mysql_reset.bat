@@ -54,7 +54,7 @@ $script:tempProcess = $null
 $serviceStopped = $false
 $serviceWasRunning = $false
 $script:plainPass = $null
-$script:appVersion = "1.1.1"
+$script:appVersion = "1.1.3"
 $dbPort = 3306
 $svcAccount = $null
 
