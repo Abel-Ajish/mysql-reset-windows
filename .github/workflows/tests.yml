@@ -1,0 +1,21 @@
+name: Windows PowerShell tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+        shell: [powershell, pwsh]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run regression tests
+        shell: ${{ matrix.shell }}
+        run: .\tests\mysql_reset.tests.ps1

@@ -1,0 +1,3 @@
+*.log
+init_*.sql
+reset_*.sql
