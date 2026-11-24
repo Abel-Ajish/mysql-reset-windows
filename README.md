@@ -38,6 +38,10 @@ select the intended one explicitly with `-ServiceName`.
 .\mysql_reset.bat -ServiceName MySQL80
 ```
 
+You can also double-click `mysql_reset.bat`. If more than one MySQL service is
+found, choose the intended service from the numbered list. When launching from a
+terminal, pass `-ServiceName` explicitly.
+
 Approve the Windows UAC prompt, enter and confirm the new password in the
 elevated PowerShell window, then confirm the reset. The selected service is
 stopped while the password is changed. The script restores its original
@@ -56,10 +60,10 @@ powershell.exe -NoProfile -File .\tests\mysql_reset.tests.ps1
 ```
 
 These checks cover embedded-script parsing, argument quoting, service
-selection, service-account ACL mapping, port parsing, and password SQL
-generation. The read-only batch preflight and MySQL configuration validator
-should also be run on each target installation. The regression suite does not
-reset a production database.
+selection (including the interactive service picker), service-account ACL
+mapping, port parsing, and password SQL generation. The read-only batch
+preflight and MySQL configuration validator should also be run on each target
+installation. The regression suite does not reset a production database.
 
 ## License
 

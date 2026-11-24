@@ -51,6 +51,9 @@ if (-not $functions.ContainsKey('Test-MySqlServiceImagePath')) {
 if (-not $functions.ContainsKey('Resolve-MySqlServiceName')) {
     throw 'The script must require an explicit choice when more than one MySQL service exists.'
 }
+if (-not $functions.ContainsKey('Select-MySqlServiceName')) {
+    throw 'Interactive runs must offer a service picker when multiple MySQL services exist.'
+}
 if (-not $functions.ContainsKey('Get-MySqlServiceAccountPrincipal')) {
     throw 'The script must map Windows built-in service accounts to portable SID-based ACL principals.'
 }
@@ -196,6 +199,26 @@ try {
 if (-not $rejectedAmbiguousServices) {
     throw 'The script must not arbitrarily select one of several MySQL services.'
 }
+$interactiveServicePicker = [scriptblock]::Create(
+    $functions['Select-MySqlServiceName'].Extent.Text +
+    "`n" +
+    '$script:servicePickerInputs = @("not-a-number", "3", "2")' +
+    "`n" +
+    '$script:servicePickerIndex = 0' +
+    "`n" +
+    'function Read-Host { $value = $script:servicePickerInputs[$script:servicePickerIndex]; $script:servicePickerIndex++; return $value }' +
+    "`n" +
+    '$selectedService = Select-MySqlServiceName -ServiceNames @("MySQL80", "MySQL_80")' +
+    "`n" +
+    '[pscustomobject]@{ Name = $selectedService; Attempts = $script:servicePickerIndex }'
+)
+$pickerResult = & $interactiveServicePicker
+if ($pickerResult.Name -ne 'MySQL_80' -or $pickerResult.Attempts -ne 3) {
+    throw 'The interactive picker must use the service explicitly selected by the user.'
+}
+if ($powerShellSource -notmatch '(?s)if \(\$serviceNames\.Count -gt 1 -and -not \$Preflight\)\s*\{\s*\$ServiceName = Select-MySqlServiceName') {
+    throw 'Interactive resets without a service name must display the service picker.'
+}
 
 $serviceAccountMapper = [scriptblock]::Create(
     $functions['Get-MySqlServiceAccountPrincipal'].Extent.Text +
@@ -282,6 +305,7 @@ Write-Output 'PASS: MySQL server arguments quote paths containing spaces.'
 Write-Output 'PASS: server port and password SQL are parsed/encoded safely.'
 Write-Output 'PASS: service command-line arguments are validated safely.'
 Write-Output 'PASS: multiple MySQL services require an explicit selection.'
+Write-Output 'PASS: interactive reset offers a validated service selection menu.'
 Write-Output 'PASS: built-in service accounts map to stable ACL SIDs.'
 Write-Output 'PASS: UAC handoff waits for the elevated process.'
 Write-Output 'PASS: pre-reset service state is tracked.'

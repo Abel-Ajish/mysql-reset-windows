@@ -189,6 +189,32 @@ function Resolve-MySqlServiceName {
     return $ServiceNames[0]
 }
 
+function Select-MySqlServiceName {
+    param([string[]]$ServiceNames)
+
+    if (-not $ServiceNames -or $ServiceNames.Count -eq 0) {
+        throw "No Windows service starting with 'mysql' was found."
+    }
+    if ($ServiceNames.Count -eq 1) {
+        return $ServiceNames[0]
+    }
+
+    Write-Host "Multiple MySQL services were found. Select the one to reset:"
+    for ($index = 0; $index -lt $ServiceNames.Count; $index++) {
+        Write-Host "  [$($index + 1)] $($ServiceNames[$index])"
+    }
+
+    while ($true) {
+        $selection = Read-Host "Enter the service number"
+        $selectedIndex = 0
+        if ([int]::TryParse($selection, [ref]$selectedIndex) -and
+            $selectedIndex -ge 1 -and $selectedIndex -le $ServiceNames.Count) {
+            return $ServiceNames[$selectedIndex - 1]
+        }
+        Write-Host "Invalid selection. Enter a number from 1 to $($ServiceNames.Count)." -ForegroundColor Red
+    }
+}
+
 function Test-MySqlServiceImagePath {
     param(
         [string]$ImagePath,
@@ -309,7 +335,11 @@ if ($isAdmin) {
 try {
     if (-not $ServiceName) {
         $serviceNames = @(Get-Service -Name "mysql*" -ErrorAction Stop | Select-Object -ExpandProperty Name)
-        $ServiceName = Resolve-MySqlServiceName -ServiceNames $serviceNames
+        if ($serviceNames.Count -gt 1 -and -not $Preflight) {
+            $ServiceName = Select-MySqlServiceName -ServiceNames $serviceNames
+        } else {
+            $ServiceName = Resolve-MySqlServiceName -ServiceNames $serviceNames
+        }
     }
     $svcObj = Get-Service -Name $ServiceName -ErrorAction Stop
     if ($svcObj.Status -notin @("Running", "Stopped")) {

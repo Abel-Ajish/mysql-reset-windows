@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 - 2026-11-24
+
+### Fixed
+
+- Double-click runs now offer an explicit numbered choice when multiple MySQL
+  services are installed, instead of exiting before password entry.
+
 ## 1.0.0 - 2026-11-24
 
 ### Added
