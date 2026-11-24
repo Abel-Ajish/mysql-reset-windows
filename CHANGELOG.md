@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2 - 2026-11-24
+
+### Fixed
+
+- Retry temporary MySQL connection-refused responses during server startup
+  instead of treating native-command stderr as a fatal PowerShell error.
+
 ## 1.1.1 - 2026-11-24
 
 ### Fixed

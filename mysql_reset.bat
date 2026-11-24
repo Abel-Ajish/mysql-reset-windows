@@ -188,6 +188,34 @@ function New-PasswordResetSql {
     ) -join [Environment]::NewLine
 }
 
+function Invoke-MySqlAuthenticationProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$MySqlExe,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Password
+    )
+
+    if (-not (Test-Path -LiteralPath $MySqlExe -PathType Leaf -ErrorAction Stop)) {
+        throw "MySQL client executable was not found at '$MySqlExe'."
+    }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $env:MYSQL_PWD = $Password
+        $output = @(& $MySqlExe @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+        $outputText = (@($output | ForEach-Object { [string]$_ }) -join " ").Trim()
+        return [pscustomobject]@{
+            ExitCode = $exitCode
+            Output = $outputText
+        }
+    } finally {
+        $env:MYSQL_PWD = $null
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
 function Resolve-MySqlServiceName {
     param([string[]]$ServiceNames)
 
@@ -1028,23 +1056,32 @@ try {
     $tempStarted = $true
 
     $ready = $false
+    $lastProbeOutput = ""
     for ($i = 0; $i -lt 35; $i++) {
         Start-Sleep -Seconds 1
         if ($script:tempProcess.HasExited) {
             throw "Temporary mysqld.exe exited unexpectedly during startup."
         }
-        $env:MYSQL_PWD = $script:plainPass
-        & $mysqlExe -h 127.0.0.1 -P $dbPort -u root -e "SELECT 1;" >$null 2>&1
-        $rc = $LASTEXITCODE
-        $env:MYSQL_PWD = $null
-        if ($rc -eq 0) {
+        $probeResult = Invoke-MySqlAuthenticationProbe `
+            -MySqlExe $mysqlExe `
+            -Arguments @("-h", "127.0.0.1", "-P", [string]$dbPort, "-u", "root", "-e", "SELECT 1;") `
+            -Password $script:plainPass
+        if ($probeResult.ExitCode -eq 0) {
             $ready = $true
             break
         }
+        $lastProbeOutput = $probeResult.Output
     }
 
     if (-not $ready) {
-        throw "Timed out waiting for temporary mysqld on port $dbPort to accept the new password."
+        $timeoutReason = "Timed out waiting for temporary mysqld on port $dbPort to accept the new password."
+        if ($lastProbeOutput) {
+            if ($lastProbeOutput.Length -gt 300) {
+                $lastProbeOutput = $lastProbeOutput.Substring(0, 300)
+            }
+            $timeoutReason += " Last MySQL client response: $lastProbeOutput"
+        }
+        throw $timeoutReason
     }
     Write-Log "[OK] Verified new root password against temporary mysqld on port $dbPort."
 } catch {

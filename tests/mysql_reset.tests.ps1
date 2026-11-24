@@ -477,6 +477,29 @@ Write-Output 'PASS: UAC handoff waits for the elevated process.'
 Write-Output 'PASS: pre-reset service state is tracked.'
 Write-Output 'PASS: non-admin staging and read-only preflight are available.'
 
+$nativeProbeFunction = $functions['Invoke-MySqlAuthenticationProbe']
+if (-not $nativeProbeFunction) {
+    throw 'Transient MySQL connection errors must be captured without aborting the startup retry loop.'
+}
+$nativeProbeTest = [scriptblock]::Create(
+    $nativeProbeFunction.Extent.Text +
+    "`nInvoke-MySqlAuthenticationProbe -MySqlExe `$env:ComSpec -Arguments @('/d', '/c', 'echo transient connect error 1>&2 & exit /b 1') -Password 'test-only'"
+)
+$ErrorActionPreference = 'Stop'
+$env:MYSQL_PWD = $null
+$probeResult = & $nativeProbeTest
+if ($probeResult.ExitCode -ne 1 -or
+    $probeResult.Output -notmatch 'transient connect error' -or
+    $ErrorActionPreference -ne 'Stop' -or
+    $null -ne $env:MYSQL_PWD) {
+    throw 'A failed native MySQL probe must be captured, preserve strict error handling, and clear the password environment variable.'
+}
+if ($powerShellSource -notmatch '(?s)\$probeResult = Invoke-MySqlAuthenticationProbe\s+`?\s*-MySqlExe \$mysqlExe') {
+    throw 'The temporary-server readiness loop must use the retry-safe authentication probe.'
+}
+$global:LASTEXITCODE = 0
+Write-Output 'PASS: transient native connection errors do not abort readiness retries.'
+
 $waitResultFunction = $functions['Wait-ForResult']
 if (-not $waitResultFunction) {
     throw 'Interactive reset results must remain visible until the user acknowledges them.'
@@ -508,7 +531,7 @@ if ($powerShellSource -notmatch '\[switch\]\$NoWait' -or
 }
 Write-Output 'PASS: reset outcomes stay visible and automation can explicitly skip waiting.'
 
-$script:appVersion = '1.1.1'
+$script:appVersion = '1.1.2'
 $uiFormFunction = [scriptblock]::Create($functions['New-MySqlUpdateForm'].Extent.Text)
 . $uiFormFunction
 $previewInfo = [pscustomobject]@{ Version = '1.2.0' }
