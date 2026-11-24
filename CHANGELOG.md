@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 - 2026-11-24
+
+### Added
+
+- On-start update checks with a native Windows dialog and explicit user consent.
+- HTTPS release downloads with strict version, size, and SHA-256 validation,
+  safe replacement with rollback, and automatic relaunch.
+- A GitHub Actions release workflow that attaches the versioned launcher asset.
+
 ## 1.0.1 - 2026-11-24
 
 ### Fixed

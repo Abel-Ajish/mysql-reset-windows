@@ -1,0 +1,33 @@
+name: Publish update asset
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify release version and upload updater asset
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v(\d+\.\d+\.\d+)$') {
+            throw "Release tag must use vMAJOR.MINOR.PATCH."
+          }
+          $releaseVersion = $Matches[1]
+          $source = [IO.File]::ReadAllText((Join-Path $PWD 'mysql_reset.bat'))
+          $versionMatch = [regex]::Match($source, '(?m)^\$script:appVersion = "(\d+\.\d+\.\d+)"\s*$')
+          if (-not $versionMatch.Success -or $versionMatch.Groups[1].Value -cne $releaseVersion) {
+            throw "Release tag $env:RELEASE_TAG does not match the utility version in mysql_reset.bat."
+          }
+          gh release upload $env:RELEASE_TAG .\mysql_reset.bat --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not upload mysql_reset.bat to release $env:RELEASE_TAG."
+          }

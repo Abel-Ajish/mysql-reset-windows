@@ -8,6 +8,7 @@ or remote servers.
 
 - Windows PowerShell 5.1, included with supported Windows client and server
   installations.
+- Windows Forms, included with Windows PowerShell, for the update dialog.
 - A local MySQL Windows service with `mysqld.exe`, `mysql.exe`, and
   `mysqladmin.exe` in the same `bin` directory.
 - Administrator approval when the reset is run.
@@ -18,6 +19,29 @@ or remote servers.
 The current verified environment is Windows PowerShell 5.1 with MySQL Server
 8.0.46. Other MySQL versions, Windows architectures, and Windows releases need
 validation on the target device before deployment.
+
+## Automatic updates
+
+On normal startup, the utility checks the latest public GitHub release. When a
+newer supported release is available, a Windows dialog lets you choose **Update
+and reopen** or **Not now**. Updates are never installed silently. The utility
+downloads only the `mysql_reset.bat` asset from this repository's HTTPS release
+URL and verifies its size, version, and SHA-256 digest against GitHub release
+metadata before replacing anything.
+
+The replacement is limited to the currently running `mysql_reset.bat` in a
+folder writable by your Windows user. It keeps a rollback copy until the new
+launcher has been started, then removes the old copy. If the folder is protected
+(for example, under `Program Files`), the update is refused and the current
+version remains unchanged; move the script to a user-writable folder to enable
+in-place updates. If the network or release metadata is unavailable, the utility
+reports the problem and continues with the current version.
+
+After an update, the new version starts its normal reset flow. It still requires
+the usual service choice, password entry, and final reset confirmation. Versions
+prior to `1.1.0` do not contain the updater; download `mysql_reset.bat` from the
+latest release once to enable future update checks. Use `-SkipUpdateCheck` to
+skip the startup check.
 
 ## Preflight
 
@@ -60,10 +84,11 @@ powershell.exe -NoProfile -File .\tests\mysql_reset.tests.ps1
 ```
 
 These checks cover embedded-script parsing, argument quoting, service
-selection (including the interactive service picker), service-account ACL
-mapping, port parsing, and password SQL generation. The read-only batch
-preflight and MySQL configuration validator should also be run on each target
-installation. The regression suite does not reset a production database.
+selection (including the interactive service picker), updater release
+validation and safe file replacement, service-account ACL mapping, port
+parsing, and password SQL generation. The read-only batch preflight and MySQL
+configuration validator should also be run on each target installation. The
+regression suite does not reset a production database.
 
 ## License
 

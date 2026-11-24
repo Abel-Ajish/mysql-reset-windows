@@ -2,6 +2,7 @@
 setlocal EnableExtensions
 set "SELF_BAT=%~f0"
 set "STAGE_DIR=%TEMP%\MySQLPasswordReset_%RANDOM%_%RANDOM%"
+set "MYSQL_RESET_LAUNCHER=%SELF_BAT%"
 set "PS1_FILE=%STAGE_DIR%\reset_root.ps1"
 if not exist "%STAGE_DIR%" mkdir "%STAGE_DIR%" >nul 2>&1
 if not exist "%STAGE_DIR%" (
@@ -9,13 +10,13 @@ if not exist "%STAGE_DIR%" (
     rmdir "%STAGE_DIR%" >nul 2>&1
     exit /b 1
 )
-more +32 "%SELF_BAT%" > "%PS1_FILE%"
+more +33 "%SELF_BAT%" > "%PS1_FILE%"
 if errorlevel 1 (
     echo [ERROR] Failed to extract PowerShell script.
     if exist "%PS1_FILE%" del /f /q "%PS1_FILE%" >nul 2>&1 & rmdir "%STAGE_DIR%" >nul 2>&1
     exit /b 1
 )
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%PS1_FILE%" -RunnerPs1 "%PS1_FILE%" %*
+powershell.exe -STA -NoProfile -ExecutionPolicy Bypass -File "%PS1_FILE%" -RunnerPs1 "%PS1_FILE%" %*
 set "RC=%errorlevel%"
 if exist "%PS1_FILE%" del /f /q "%PS1_FILE%"
 if exist "%PS1_FILE%" (
@@ -37,7 +38,8 @@ param(
     [string]$DefaultsFile = "",
     [string]$LogDir = "$env:ProgramData\MySQLPasswordReset",
     [switch]$Elevated,
-    [switch]$Preflight
+    [switch]$Preflight,
+    [switch]$SkipUpdateCheck
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +53,7 @@ $script:tempProcess = $null
 $serviceStopped = $false
 $serviceWasRunning = $false
 $script:plainPass = $null
+$script:appVersion = "1.1.0"
 $dbPort = 3306
 $svcAccount = $null
 
@@ -215,6 +218,440 @@ function Select-MySqlServiceName {
     }
 }
 
+function Get-MySqlUpdateInfo {
+    param(
+        [Parameter(Mandatory = $true)]$Release,
+        [Parameter(Mandatory = $true)][string]$CurrentVersion
+    )
+
+    $tag = [string]$Release.tag_name
+    if ($Release.draft -or $Release.prerelease -or $tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+        throw "The latest GitHub release has an unsupported version tag."
+    }
+
+    try {
+        $latestVersion = [version]$Matches[1]
+        $installedVersion = [version]$CurrentVersion
+    } catch {
+        throw "The installed or published application version is invalid."
+    }
+    if ($latestVersion -le $installedVersion) {
+        return $null
+    }
+
+    $expectedReleaseUrl = "https://github.com/Abel-Ajish/mysql-reset-windows/releases/tag/$tag"
+    if ([string]$Release.html_url -cne $expectedReleaseUrl) {
+        throw "The latest release URL does not match the trusted repository and tag."
+    }
+
+    $matchingAssets = @($Release.assets | Where-Object { $_.name -ceq "mysql_reset.bat" })
+    if ($matchingAssets.Count -ne 1) {
+        throw "The latest release must contain exactly one mysql_reset.bat update asset."
+    }
+    $asset = $matchingAssets[0]
+    if ($asset.state -cne "uploaded" -or
+        $asset.size -lt 100 -or
+        $asset.size -gt 1048576 -or
+        [string]$asset.digest -notmatch '^sha256:([a-fA-F0-9]{64})$') {
+        throw "The update asset is incomplete or does not have a valid SHA-256 digest."
+    }
+
+    $expectedAssetPath = "/Abel-Ajish/mysql-reset-windows/releases/download/$tag/mysql_reset.bat"
+    $assetUri = $null
+    if (-not [Uri]::TryCreate([string]$asset.browser_download_url, [UriKind]::Absolute, [ref]$assetUri) -or
+        $assetUri.Scheme -cne "https" -or
+        $assetUri.Host -ine "github.com" -or
+        $assetUri.AbsolutePath -cne $expectedAssetPath -or
+        $assetUri.Query -or
+        $assetUri.Fragment) {
+        throw "The update asset URL is not the expected HTTPS GitHub release asset."
+    }
+
+    return [pscustomobject]@{
+        Tag = $tag
+        Version = $latestVersion.ToString()
+        DownloadUrl = $assetUri.AbsoluteUri
+        Digest = $Matches[1].ToLowerInvariant()
+        Size = [int64]$asset.size
+        ReleaseUrl = $expectedReleaseUrl
+        ReleaseNotes = [string]$Release.body
+    }
+}
+
+function Get-MySqlLatestUpdateInfo {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $headers = @{ Accept = "application/vnd.github+json" }
+    $release = Invoke-RestMethod `
+        -Uri "https://api.github.com/repos/Abel-Ajish/mysql-reset-windows/releases/latest" `
+        -Headers $headers `
+        -UserAgent "MySQLPasswordReset/$script:appVersion" `
+        -TimeoutSec 15 `
+        -ErrorAction Stop
+    return Get-MySqlUpdateInfo -Release $release -CurrentVersion $script:appVersion
+}
+
+function Test-MySqlUpdateLauncher {
+    param(
+        [Parameter(Mandatory = $true)][string]$LauncherPath,
+        [Parameter(Mandatory = $true)][string]$CurrentVersion
+    )
+
+    $targetPath = [IO.Path]::GetFullPath($LauncherPath)
+    if ([IO.Path]::GetFileName($targetPath) -cne "mysql_reset.bat" -or
+        -not [IO.File]::Exists($targetPath)) {
+        throw "The updater target must be the current mysql_reset.bat file."
+    }
+
+    $targetInfo = New-Object IO.FileInfo($targetPath)
+    if (($targetInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The updater will not replace a launcher that is a symbolic link or reparse point."
+    }
+
+    $currentText = [IO.File]::ReadAllText($targetPath)
+    $versionMatch = [regex]::Match($currentText, '(?m)^\$script:appVersion = "(\d+\.\d+\.\d+)"\s*$')
+    if (-not $versionMatch.Success -or $versionMatch.Groups[1].Value -cne $CurrentVersion) {
+        throw "The current launcher does not identify itself as version $CurrentVersion."
+    }
+
+    $probePath = Join-Path $targetInfo.DirectoryName (".mysql_reset_write_probe_" + [guid]::NewGuid().ToString("N"))
+    $probeCreated = $false
+    try {
+        $probe = [IO.File]::Open($probePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $probeCreated = $true
+        $probe.Dispose()
+    } catch {
+        throw "This launcher folder is not writable by the current user. Move mysql_reset.bat to a user-writable folder to enable updates."
+    } finally {
+        if ($probeCreated -and [IO.File]::Exists($probePath)) {
+            [IO.File]::Delete($probePath)
+        }
+    }
+
+    return $targetPath
+}
+
+function Replace-MySqlLauncher {
+    param(
+        [Parameter(Mandatory = $true)][string]$LauncherPath,
+        [Parameter(Mandatory = $true)][string]$DownloadedPath,
+        [Parameter(Mandatory = $true)]$UpdateInfo,
+        [Parameter(Mandatory = $true)][string]$CurrentVersion
+    )
+
+    $targetPath = Test-MySqlUpdateLauncher -LauncherPath $LauncherPath -CurrentVersion $CurrentVersion
+    if (-not [IO.File]::Exists($DownloadedPath) -or
+        (Get-Item -LiteralPath $DownloadedPath -ErrorAction Stop).Length -ne $UpdateInfo.Size) {
+        throw "The downloaded update file is missing or has an unexpected size."
+    }
+    $downloadedHash = (Get-FileHash -LiteralPath $DownloadedPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    if ($downloadedHash -cne $UpdateInfo.Digest) {
+        throw "The downloaded update failed its SHA-256 integrity check."
+    }
+    $downloadedText = [IO.File]::ReadAllText($DownloadedPath)
+    $downloadedVersion = [regex]::Match($downloadedText, '(?m)^\$script:appVersion = "(\d+\.\d+\.\d+)"\s*$')
+    if (-not $downloadedVersion.Success -or $downloadedVersion.Groups[1].Value -cne $UpdateInfo.Version) {
+        throw "The update file version does not match the published release."
+    }
+
+    $directory = [IO.Path]::GetDirectoryName($targetPath)
+    $nonce = [guid]::NewGuid().ToString("N")
+    $stagedPath = Join-Path $directory (".mysql_reset_update_$nonce.tmp")
+    $backupPath = Join-Path $directory (".mysql_reset_backup_$nonce.bat")
+    $failedPath = Join-Path $directory (".mysql_reset_failed_$nonce.tmp")
+    $replaced = $false
+    try {
+        [IO.File]::Copy($DownloadedPath, $stagedPath, $false)
+        $stagedHash = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        if ($stagedHash -cne $UpdateInfo.Digest) {
+            throw "The staged update failed its SHA-256 integrity check."
+        }
+        [IO.File]::Replace($stagedPath, $targetPath, $backupPath)
+        $replaced = $true
+        $installedHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        if ($installedHash -cne $UpdateInfo.Digest) {
+            throw "The installed update failed post-replacement verification."
+        }
+        return $backupPath
+    } catch {
+        if ($replaced -and [IO.File]::Exists($backupPath)) {
+            [IO.File]::Replace($backupPath, $targetPath, $failedPath)
+            if ([IO.File]::Exists($failedPath)) {
+                [IO.File]::Delete($failedPath)
+            }
+        }
+        throw
+    } finally {
+        if ([IO.File]::Exists($stagedPath)) {
+            [IO.File]::Delete($stagedPath)
+        }
+    }
+}
+
+function Download-MySqlUpdateFile {
+    param([Parameter(Mandatory = $true)]$UpdateInfo)
+
+    if ($UpdateInfo.Size -lt 100 -or
+        $UpdateInfo.Size -gt 1048576 -or
+        $UpdateInfo.Digest -notmatch '^[a-f0-9]{64}$') {
+        throw "The update metadata failed size or digest validation."
+    }
+
+    $downloadPath = Join-Path ([IO.Path]::GetTempPath()) ("mysql_reset_update_" + [guid]::NewGuid().ToString("N") + ".bat")
+    $request = [Net.HttpWebRequest]::Create([Uri]$UpdateInfo.DownloadUrl)
+    $request.Method = "GET"
+    $request.UserAgent = "MySQLPasswordReset/$script:appVersion"
+    $request.Timeout = 15000
+    $request.ReadWriteTimeout = 15000
+    $request.AllowAutoRedirect = $true
+    $request.MaximumAutomaticRedirections = 5
+    $response = $null
+    $responseStream = $null
+    $outputStream = $null
+
+    try {
+        $response = [Net.HttpWebResponse]$request.GetResponse()
+        $responseUri = $response.ResponseUri
+        $allowedHosts = @("github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com")
+        if ($responseUri.Scheme -cne "https" -or $responseUri.Host -notin $allowedHosts) {
+            throw "The update download redirected outside the trusted HTTPS GitHub hosts."
+        }
+        if ($response.ContentLength -ne $UpdateInfo.Size) {
+            throw "The update download size does not match the published release metadata."
+        }
+
+        $responseStream = $response.GetResponseStream()
+        $outputStream = [IO.File]::Open($downloadPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $buffer = New-Object byte[] 8192
+        $totalBytes = [int64]0
+        while (($bytesRead = $responseStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $totalBytes += $bytesRead
+            if ($totalBytes -gt 1048576 -or $totalBytes -gt $UpdateInfo.Size) {
+                throw "The update download exceeded its allowed size."
+            }
+            $outputStream.Write($buffer, 0, $bytesRead)
+        }
+        $outputStream.Flush()
+        $outputStream.Dispose()
+        $outputStream = $null
+        $responseStream.Dispose()
+        $responseStream = $null
+
+        if ($totalBytes -ne $UpdateInfo.Size) {
+            throw "The update download was incomplete."
+        }
+        $downloadedHash = (Get-FileHash -LiteralPath $downloadPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        if ($downloadedHash -cne $UpdateInfo.Digest) {
+            throw "The update download failed its SHA-256 integrity check."
+        }
+        $downloadedText = [IO.File]::ReadAllText($downloadPath)
+        $downloadedVersion = [regex]::Match($downloadedText, '(?m)^\$script:appVersion = "(\d+\.\d+\.\d+)"\s*$')
+        if (-not $downloadedVersion.Success -or $downloadedVersion.Groups[1].Value -cne $UpdateInfo.Version) {
+            throw "The downloaded script version does not match the published release."
+        }
+        return $downloadPath
+    } catch {
+        if ([IO.File]::Exists($downloadPath)) {
+            [IO.File]::Delete($downloadPath)
+        }
+        throw
+    } finally {
+        if ($outputStream) { $outputStream.Dispose() }
+        if ($responseStream) { $responseStream.Dispose() }
+        if ($response) { $response.Dispose() }
+    }
+}
+
+function Install-MySqlUpdate {
+    param(
+        [Parameter(Mandatory = $true)]$UpdateInfo,
+        [Parameter(Mandatory = $true)][string]$LauncherPath
+    )
+
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($isAdmin) {
+        throw "The self-updater must run before UAC elevation. Close this window and launch mysql_reset.bat normally."
+    }
+
+    $downloadedPath = $null
+    $backupPath = $null
+    try {
+        $downloadedPath = Download-MySqlUpdateFile -UpdateInfo $UpdateInfo
+        $backupPath = Replace-MySqlLauncher `
+            -LauncherPath $LauncherPath `
+            -DownloadedPath $downloadedPath `
+            -UpdateInfo $UpdateInfo `
+            -CurrentVersion $script:appVersion
+        try {
+            Start-Process -FilePath $LauncherPath -WorkingDirectory ([IO.Path]::GetDirectoryName($LauncherPath)) -ErrorAction Stop | Out-Null
+        } catch {
+            $failedPath = Join-Path ([IO.Path]::GetDirectoryName($LauncherPath)) (".mysql_reset_failed_" + [guid]::NewGuid().ToString("N") + ".tmp")
+            [IO.File]::Replace($backupPath, $LauncherPath, $failedPath)
+            if ([IO.File]::Exists($failedPath)) {
+                [IO.File]::Delete($failedPath)
+            }
+            $backupPath = $null
+            throw "The updated utility could not be reopened; the previous version was restored. $($_.Exception.Message)"
+        }
+
+        try {
+            [IO.File]::Delete($backupPath)
+            $backupPath = $null
+        } catch {
+            Write-Warning "The update is installed, but the old-version backup could not be deleted: '$backupPath'. Remove it manually."
+        }
+    } finally {
+        if ($downloadedPath -and [IO.File]::Exists($downloadedPath)) {
+            try {
+                [IO.File]::Delete($downloadedPath)
+            } catch {
+                Write-Warning "Could not remove temporary update file '$downloadedPath'."
+            }
+        }
+    }
+}
+
+function New-MySqlUpdateForm {
+    param(
+        [Parameter(Mandatory = $true)]$UpdateInfo,
+        [Parameter(Mandatory = $true)][string]$LauncherPath
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "MySQL Password Reset - Update"
+    $form.ClientSize = New-Object System.Drawing.Size(520, 318)
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $true
+    $form.BackColor = [System.Drawing.Color]::FromArgb(245, 247, 250)
+    $form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = [System.Windows.Forms.DockStyle]::Top
+    $header.Height = 88
+    $header.BackColor = [System.Drawing.Color]::FromArgb(24, 43, 62)
+    $form.Controls.Add($header)
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "A safer reset tool is ready"
+    $title.ForeColor = [System.Drawing.Color]::White
+    $title.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 16)
+    $title.Location = New-Object System.Drawing.Point(24, 14)
+    $title.Size = New-Object System.Drawing.Size(470, 32)
+    $header.Controls.Add($title)
+
+    $subtitle = New-Object System.Windows.Forms.Label
+    $subtitle.Text = "Review the version, then choose when to update."
+    $subtitle.ForeColor = [System.Drawing.Color]::FromArgb(215, 225, 235)
+    $subtitle.Location = New-Object System.Drawing.Point(26, 52)
+    $subtitle.Size = New-Object System.Drawing.Size(460, 22)
+    $header.Controls.Add($subtitle)
+
+    $versionLabel = New-Object System.Windows.Forms.Label
+    $versionLabel.Text = "Installed  $script:appVersion     Available  $($UpdateInfo.Version)"
+    $versionLabel.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
+    $versionLabel.ForeColor = [System.Drawing.Color]::FromArgb(35, 52, 70)
+    $versionLabel.Location = New-Object System.Drawing.Point(26, 108)
+    $versionLabel.Size = New-Object System.Drawing.Size(460, 25)
+    $versionLabel.AccessibleName = "Installed and available versions"
+    $form.Controls.Add($versionLabel)
+
+    $details = New-Object System.Windows.Forms.Label
+    $details.Text = "The update is downloaded from the official GitHub release and verified before replacing this file. Your current copy is kept if verification or installation fails."
+    $details.Location = New-Object System.Drawing.Point(26, 142)
+    $details.Size = New-Object System.Drawing.Size(462, 56)
+    $details.ForeColor = [System.Drawing.Color]::FromArgb(73, 87, 101)
+    $details.AccessibleName = "Update and safety details"
+    $form.Controls.Add($details)
+
+    $status = New-Object System.Windows.Forms.Label
+    $status.Text = "The reset will not run until you confirm it in the updated app."
+    $status.Location = New-Object System.Drawing.Point(26, 202)
+    $status.Size = New-Object System.Drawing.Size(462, 38)
+    $status.ForeColor = [System.Drawing.Color]::FromArgb(0, 105, 100)
+    $status.AccessibleName = "Update status"
+    $form.Controls.Add($status)
+
+    $updateButton = New-Object System.Windows.Forms.Button
+    $updateButton.Text = "Update and reopen"
+    $updateButton.Size = New-Object System.Drawing.Size(150, 36)
+    $updateButton.Location = New-Object System.Drawing.Point(334, 262)
+    $updateButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $updateButton.FlatAppearance.BorderSize = 0
+    $updateButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 115)
+    $updateButton.ForeColor = [System.Drawing.Color]::White
+    $updateButton.AccessibleName = "Verify, install, and reopen the update"
+    $form.Controls.Add($updateButton)
+
+    $laterButton = New-Object System.Windows.Forms.Button
+    $laterButton.Text = "Not now"
+    $laterButton.Size = New-Object System.Drawing.Size(92, 36)
+    $laterButton.Location = New-Object System.Drawing.Point(230, 262)
+    $laterButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $laterButton.BackColor = [System.Drawing.Color]::White
+    $laterButton.ForeColor = [System.Drawing.Color]::FromArgb(35, 52, 70)
+    $laterButton.AccessibleName = "Continue with the current version"
+    $form.Controls.Add($laterButton)
+
+    $form.AcceptButton = $updateButton
+    $form.CancelButton = $laterButton
+    $form.Tag = "Later"
+    $laterButton.Add_Click({ $form.Close() }.GetNewClosure())
+    $updateButton.Add_Click({
+        $updateButton.Enabled = $false
+        $laterButton.Enabled = $false
+        $status.Text = "Downloading and verifying the update..."
+        $status.ForeColor = [System.Drawing.Color]::FromArgb(0, 105, 100)
+        $form.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            Install-MySqlUpdate -UpdateInfo $UpdateInfo -LauncherPath $LauncherPath
+            $form.Tag = "Updated"
+            $form.Close()
+        } catch {
+            $message = $_.Exception.Message
+            if ($message.Length -gt 300) {
+                $message = $message.Substring(0, 300)
+            }
+            $status.Text = "Update was not installed. Your current version is unchanged."
+            $status.ForeColor = [System.Drawing.Color]::FromArgb(160, 55, 45)
+            $details.Text = $message
+            $updateButton.Text = "Try again"
+            $updateButton.Enabled = $true
+            $laterButton.Enabled = $true
+        }
+    }.GetNewClosure())
+
+    return [pscustomobject]@{
+        Form = $form
+        UpdateButton = $updateButton
+        LaterButton = $laterButton
+        StatusLabel = $status
+    }
+}
+
+function Show-MySqlUpdateDialog {
+    param(
+        [Parameter(Mandatory = $true)]$UpdateInfo,
+        [Parameter(Mandatory = $true)][string]$LauncherPath
+    )
+
+    $dialog = New-MySqlUpdateForm -UpdateInfo $UpdateInfo -LauncherPath $LauncherPath
+    try {
+        $null = $dialog.Form.ShowDialog()
+        return [string]$dialog.Form.Tag
+    } finally {
+        $dialog.Form.Dispose()
+    }
+}
+
 function Test-MySqlServiceImagePath {
     param(
         [string]$ImagePath,
@@ -294,6 +731,31 @@ function Fail-WithReport {
 Write-Log "=== MySQL Password Reset Started ==="
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $Preflight -and -not $SkipUpdateCheck -and -not $Elevated) {
+    if ($isAdmin) {
+        Write-Log "[INFO] Skipping automatic update checks because this process is already elevated."
+    } else {
+        try {
+            $updateInfo = Get-MySqlLatestUpdateInfo
+            if ($updateInfo) {
+                $launcherPath = [Environment]::GetEnvironmentVariable("MYSQL_RESET_LAUNCHER", "Process")
+                if ([string]::IsNullOrWhiteSpace($launcherPath)) {
+                    throw "The current mysql_reset.bat path could not be determined."
+                }
+                $updateChoice = Show-MySqlUpdateDialog -UpdateInfo $updateInfo -LauncherPath $launcherPath
+                if ($updateChoice -eq "Updated") {
+                    exit 0
+                }
+                Write-Log "[INFO] Update deferred; continuing with version $script:appVersion."
+            } else {
+                Write-Log "[OK] MySQL Password Reset version $script:appVersion is up to date."
+            }
+        } catch {
+            Write-Log "[WARN] Update check failed; continuing with version $script:appVersion. $($_.Exception.Message)"
+        }
+    }
+}
+
 if (-not $isAdmin -and -not $Preflight) {
     if ($Elevated) {
         Fail-WithReport -Step "Step 1: UAC Elevation" -ExitCode 5 -Reason "Elevated process did not receive Administrator rights." -Fix "Run PowerShell or Command Prompt as Administrator manually."
@@ -308,6 +770,7 @@ if (-not $isAdmin -and -not $Preflight) {
     try {
         $targetScript = if ($RunnerPs1) { $RunnerPs1 } else { $PSCommandPath }
         $argList = @(
+            "-STA",
             "-NoProfile",
             "-ExecutionPolicy", "Bypass",
             "-File", "`"$targetScript`"",

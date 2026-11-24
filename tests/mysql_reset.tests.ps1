@@ -54,6 +54,18 @@ if (-not $functions.ContainsKey('Resolve-MySqlServiceName')) {
 if (-not $functions.ContainsKey('Select-MySqlServiceName')) {
     throw 'Interactive runs must offer a service picker when multiple MySQL services exist.'
 }
+if (-not $functions.ContainsKey('Get-MySqlUpdateInfo') -or
+    -not $functions.ContainsKey('Get-MySqlLatestUpdateInfo') -or
+    -not $functions.ContainsKey('Download-MySqlUpdateFile') -or
+    -not $functions.ContainsKey('Install-MySqlUpdate') -or
+    -not $functions.ContainsKey('New-MySqlUpdateForm') -or
+    -not $functions.ContainsKey('Show-MySqlUpdateDialog')) {
+    throw 'The updater must strictly validate release versions and asset metadata before offering an update.'
+}
+if (-not $functions.ContainsKey('Test-MySqlUpdateLauncher') -or
+    -not $functions.ContainsKey('Replace-MySqlLauncher')) {
+    throw 'The updater must replace only the validated current launcher and preserve rollback on failure.'
+}
 if (-not $functions.ContainsKey('Get-MySqlServiceAccountPrincipal')) {
     throw 'The script must map Windows built-in service accounts to portable SID-based ACL principals.'
 }
@@ -208,6 +220,8 @@ $interactiveServicePicker = [scriptblock]::Create(
     "`n" +
     'function Read-Host { $value = $script:servicePickerInputs[$script:servicePickerIndex]; $script:servicePickerIndex++; return $value }' +
     "`n" +
+    'function Write-Host { }' +
+    "`n" +
     '$selectedService = Select-MySqlServiceName -ServiceNames @("MySQL80", "MySQL_80")' +
     "`n" +
     '[pscustomobject]@{ Name = $selectedService; Attempts = $script:servicePickerIndex }'
@@ -218,6 +232,150 @@ if ($pickerResult.Name -ne 'MySQL_80' -or $pickerResult.Attempts -ne 3) {
 }
 if ($powerShellSource -notmatch '(?s)if \(\$serviceNames\.Count -gt 1 -and -not \$Preflight\)\s*\{\s*\$ServiceName = Select-MySqlServiceName') {
     throw 'Interactive resets without a service name must display the service picker.'
+}
+
+$validReleaseResolver = [scriptblock]::Create(
+    $functions['Get-MySqlUpdateInfo'].Extent.Text +
+    "`n" +
+    '$release = [pscustomobject]@{' +
+    ' tag_name = "v1.2.0"; draft = $false; prerelease = $false;' +
+    ' html_url = "https://github.com/Abel-Ajish/mysql-reset-windows/releases/tag/v1.2.0";' +
+    ' assets = @([pscustomobject]@{' +
+    ' name = "mysql_reset.bat"; state = "uploaded"; size = 27000;' +
+    ' digest = "sha256:' + ('a' * 64) + '";' +
+    ' browser_download_url = "https://github.com/Abel-Ajish/mysql-reset-windows/releases/download/v1.2.0/mysql_reset.bat"' +
+    ' })' +
+    '}; Get-MySqlUpdateInfo -Release $release -CurrentVersion "1.1.0"'
+)
+$validUpdateInfo = & $validReleaseResolver
+if ($validUpdateInfo.Version -ne '1.2.0' -or
+    $validUpdateInfo.Digest -ne ('a' * 64) -or
+    $validUpdateInfo.Size -ne 27000) {
+    throw 'A valid newer release must return its validated version, digest, and size.'
+}
+
+$currentReleaseResolver = [scriptblock]::Create(
+    $functions['Get-MySqlUpdateInfo'].Extent.Text +
+    "`n" +
+    '$release = [pscustomobject]@{' +
+    ' tag_name = "v1.1.0"; draft = $false; prerelease = $false; assets = @()' +
+    '}; Get-MySqlUpdateInfo -Release $release -CurrentVersion "1.1.0"'
+)
+if ($null -ne (& $currentReleaseResolver)) {
+    throw 'The updater must not offer an update when the installed version is current.'
+}
+
+$unsafeReleaseResolver = [scriptblock]::Create(
+    $functions['Get-MySqlUpdateInfo'].Extent.Text +
+    "`n" +
+    '$release = [pscustomobject]@{' +
+    ' tag_name = "v1.2.0"; draft = $false; prerelease = $false;' +
+    ' assets = @([pscustomobject]@{' +
+    ' name = "mysql_reset.bat"; state = "uploaded"; size = 27000;' +
+    ' digest = "sha256:' + ('a' * 64) + '";' +
+    ' browser_download_url = "https://example.invalid/mysql_reset.bat"' +
+    ' })' +
+    '}; Get-MySqlUpdateInfo -Release $release -CurrentVersion "1.1.0"'
+)
+$rejectedUnsafeUpdateUrl = $false
+try {
+    & $unsafeReleaseResolver | Out-Null
+} catch {
+    $rejectedUnsafeUpdateUrl = $true
+}
+if (-not $rejectedUnsafeUpdateUrl) {
+    throw 'The updater must reject release assets outside the fixed GitHub repository.'
+}
+$invalidDigestResolver = [scriptblock]::Create(
+    $functions['Get-MySqlUpdateInfo'].Extent.Text +
+    "`n" +
+    '$release = [pscustomobject]@{' +
+    ' tag_name = "v1.2.0"; draft = $false; prerelease = $false;' +
+    ' html_url = "https://github.com/Abel-Ajish/mysql-reset-windows/releases/tag/v1.2.0";' +
+    ' assets = @([pscustomobject]@{' +
+    ' name = "mysql_reset.bat"; state = "uploaded"; size = 27000;' +
+    ' digest = $null;' +
+    ' browser_download_url = "https://github.com/Abel-Ajish/mysql-reset-windows/releases/download/v1.2.0/mysql_reset.bat"' +
+    ' })' +
+    '}; Get-MySqlUpdateInfo -Release $release -CurrentVersion "1.1.0"'
+)
+$rejectedMissingDigest = $false
+try {
+    & $invalidDigestResolver | Out-Null
+} catch {
+    $rejectedMissingDigest = $true
+}
+if (-not $rejectedMissingDigest) {
+    throw 'The updater must fail closed when GitHub does not provide an asset digest.'
+}
+if ($powerShellSource -notmatch '(?s)if \(-not \$Preflight -and -not \$SkipUpdateCheck -and -not \$Elevated\)') {
+    throw 'Preflight and elevated reruns must not perform automatic update checks.'
+}
+if ($powerShellSource.IndexOf('$updateInfo = Get-MySqlLatestUpdateInfo') -lt 0 -or
+    $powerShellSource.IndexOf('$updateInfo = Get-MySqlLatestUpdateInfo') -gt $powerShellSource.IndexOf('if (-not $isAdmin -and -not $Preflight)')) {
+    throw 'Update checks must complete before the UAC elevation handoff.'
+}
+
+$updateTestRoot = Join-Path $env:TEMP ("MySqlResetUpdaterTest_" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $updateTestRoot -ErrorAction Stop | Out-Null
+try {
+    $replacementFunctions = [scriptblock]::Create(
+        $functions['Test-MySqlUpdateLauncher'].Extent.Text +
+        "`n" +
+        $functions['Replace-MySqlLauncher'].Extent.Text
+    )
+    . $replacementFunctions
+
+    $launcherPath = Join-Path $updateTestRoot 'mysql_reset.bat'
+    $downloadedPath = Join-Path $updateTestRoot 'verified_update.bat'
+    $oldLauncher = '@echo off' + [Environment]::NewLine + '$script:appVersion = "1.1.0"'
+    $newLauncher = '@echo off' + [Environment]::NewLine + '$script:appVersion = "1.2.0"'
+    [IO.File]::WriteAllText($launcherPath, $oldLauncher)
+    [IO.File]::WriteAllText($downloadedPath, $newLauncher)
+    $newDigest = (Get-FileHash -LiteralPath $downloadedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $update = [pscustomobject]@{
+        Version = '1.2.0'
+        Digest = $newDigest
+        Size = (Get-Item -LiteralPath $downloadedPath).Length
+    }
+
+    $badDigestUpdate = [pscustomobject]@{
+        Version = '1.2.0'
+        Digest = ('0' * 64)
+        Size = $update.Size
+    }
+    $rejectedTamperedUpdate = $false
+    try {
+        Replace-MySqlLauncher -LauncherPath $launcherPath -DownloadedPath $downloadedPath -UpdateInfo $badDigestUpdate -CurrentVersion '1.1.0' | Out-Null
+    } catch {
+        $rejectedTamperedUpdate = $true
+    }
+    if (-not $rejectedTamperedUpdate -or
+        [IO.File]::ReadAllText($launcherPath) -ne $oldLauncher) {
+        throw 'A digest mismatch must leave the current launcher unchanged.'
+    }
+
+    $wrongNamePath = Join-Path $updateTestRoot 'not_mysql_reset.bat'
+    [IO.File]::WriteAllText($wrongNamePath, $oldLauncher)
+    $rejectedWrongTarget = $false
+    try {
+        Replace-MySqlLauncher -LauncherPath $wrongNamePath -DownloadedPath $downloadedPath -UpdateInfo $update -CurrentVersion '1.1.0' | Out-Null
+    } catch {
+        $rejectedWrongTarget = $true
+    }
+    if (-not $rejectedWrongTarget -or
+        [IO.File]::ReadAllText($wrongNamePath) -ne $oldLauncher) {
+        throw 'The updater must refuse to replace a file other than the current named launcher.'
+    }
+
+    $backupPath = Replace-MySqlLauncher -LauncherPath $launcherPath -DownloadedPath $downloadedPath -UpdateInfo $update -CurrentVersion '1.1.0'
+    if ([IO.File]::ReadAllText($launcherPath) -ne $newLauncher -or
+        -not (Test-Path -LiteralPath $backupPath) -or
+        [IO.File]::ReadAllText($backupPath) -ne $oldLauncher) {
+        throw 'A verified replacement must install the new launcher and preserve a rollback copy.'
+    }
+} finally {
+    Remove-Item -LiteralPath $updateTestRoot -Recurse -Force -ErrorAction Stop
 }
 
 $serviceAccountMapper = [scriptblock]::Create(
@@ -267,7 +425,13 @@ $elevationCall = [regex]::Match(
 if (-not $elevationCall.Success -or
     $elevationCall.Value -notmatch '-Wait' -or
     $elevationCall.Value -notmatch '-PassThru') {
-    throw 'The UAC handoff must wait for and return the elevated process result.'
+    throw 'The UAC handoff must use STA mode, wait for the elevated process, and return its exit code.'
+}
+if ($powerShellSource -notmatch '(?s)\$argList\s*=\s*@\(\s*"-STA"') {
+    throw 'The elevated PowerShell process must also use STA mode for the Windows Forms update dialog.'
+}
+if (-not ($lines[0..$markerIndex] -match 'powershell\.exe -STA ')) {
+    throw 'The batch launcher must use STA mode for the Windows Forms update dialog.'
 }
 
 if ($powerShellSource -notmatch '\$serviceWasRunning') {
@@ -306,7 +470,28 @@ Write-Output 'PASS: server port and password SQL are parsed/encoded safely.'
 Write-Output 'PASS: service command-line arguments are validated safely.'
 Write-Output 'PASS: multiple MySQL services require an explicit selection.'
 Write-Output 'PASS: interactive reset offers a validated service selection menu.'
+Write-Output 'PASS: updater validates release versions, URLs, sizes, and digests.'
+Write-Output 'PASS: updater requires consent, runs before UAC, and safely replaces only the launcher.'
 Write-Output 'PASS: built-in service accounts map to stable ACL SIDs.'
 Write-Output 'PASS: UAC handoff waits for the elevated process.'
 Write-Output 'PASS: pre-reset service state is tracked.'
 Write-Output 'PASS: non-admin staging and read-only preflight are available.'
+
+$script:appVersion = '1.1.0'
+$uiFormFunction = [scriptblock]::Create($functions['New-MySqlUpdateForm'].Extent.Text)
+. $uiFormFunction
+$previewInfo = [pscustomobject]@{ Version = '1.2.0' }
+$updateDialog = New-MySqlUpdateForm -UpdateInfo $previewInfo -LauncherPath 'C:\Preview\mysql_reset.bat'
+try {
+    if ($updateDialog.Form.Text -ne 'MySQL Password Reset - Update' -or
+        $updateDialog.Form.ClientSize.Width -lt 520 -or
+        $updateDialog.UpdateButton.Right -gt $updateDialog.Form.ClientSize.Width -or
+        $updateDialog.LaterButton.Right -gt $updateDialog.Form.ClientSize.Width -or
+        $updateDialog.UpdateButton.AccessibleName -ne 'Verify, install, and reopen the update' -or
+        $updateDialog.LaterButton.AccessibleName -ne 'Continue with the current version') {
+        throw 'The update dialog must have its expected title, fit its actions, and expose accessible labels.'
+    }
+} finally {
+    $updateDialog.Form.Dispose()
+}
+Write-Output 'PASS: native update dialog constructs with accessible actions and expected layout.'
