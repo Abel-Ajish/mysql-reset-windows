@@ -12,10 +12,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-2022, windows-2025]
-        shell: [powershell, pwsh]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Run regression tests
-        shell: ${{ matrix.shell }}
+      - name: Run regression tests with Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\mysql_reset.tests.ps1
+      - name: Run regression tests with PowerShell 7
+        shell: pwsh
         run: .\tests\mysql_reset.tests.ps1
