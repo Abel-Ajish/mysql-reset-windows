@@ -231,7 +231,7 @@ try {
     $wrongInitFileRejected = $_.Exception.Message -match 'expected init-file argument'
 }
 if (-not $wrongInitFileRejected) {
-    throw 'The launched process must use this run’s exact init file before its listener is trusted.'
+    throw 'The launched process must use the exact init file created for this run before its listener is trusted.'
 }
 Write-Output 'PASS: direct and child mysqld owners are verified; unrelated owners are rejected.'
 
