@@ -1,5 +1,10 @@
 @echo off
 setlocal EnableExtensions
+powershell.exe -NoProfile -Command "if ($PSVersionTable.PSVersion.Major -lt 3) { exit 1 }" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Windows PowerShell 3.0 or later is required.
+    exit /b 1
+)
 set "SELF_BAT=%~f0"
 set "STAGE_DIR=%TEMP%\MySQLPasswordReset_%RANDOM%_%RANDOM%"
 set "MYSQL_RESET_LAUNCHER=%SELF_BAT%"
@@ -10,7 +15,7 @@ if not exist "%STAGE_DIR%" (
     rmdir "%STAGE_DIR%" >nul 2>&1
     exit /b 1
 )
-more +33 "%SELF_BAT%" > "%PS1_FILE%"
+more +38 "%SELF_BAT%" > "%PS1_FILE%"
 if errorlevel 1 (
     echo [ERROR] Failed to extract PowerShell script.
     if exist "%PS1_FILE%" del /f /q "%PS1_FILE%" >nul 2>&1 & rmdir "%STAGE_DIR%" >nul 2>&1
@@ -39,6 +44,7 @@ param(
     [string]$LogDir = "$env:ProgramData\MySQLPasswordReset",
     [switch]$Elevated,
     [switch]$Preflight,
+    [switch]$Console,
     [switch]$SkipUpdateCheck,
     [switch]$NoWait
 )
@@ -49,20 +55,43 @@ $logFile = $null
 $initFile = $null
 $script:loggingEnabled = $false
 $script:runDir = $null
+$script:resetUi = $null
+$script:resetUiEnabled = $false
+$script:resetUiFallbackReason = $null
+$script:resetSecurePassword = $null
 $tempStarted = $false
 $script:tempProcess = $null
 $serviceStopped = $false
 $serviceWasRunning = $false
 $script:plainPass = $null
-$script:appVersion = "1.1.3"
+$script:appVersion = "1.2.0"
 $dbPort = 3306
 $svcAccount = $null
+
+function Test-MySqlResetUiSupported {
+    param([Parameter(Mandatory = $true)][Version]$PowerShellVersion)
+    return $PowerShellVersion -ge [Version]"5.1"
+}
+
+$script:resetUiEnabled = (-not $Console -and -not $Preflight -and
+    (Test-MySqlResetUiSupported -PowerShellVersion $PSVersionTable.PSVersion))
+if (-not $Console -and -not $Preflight -and -not $script:resetUiEnabled) {
+    $script:resetUiFallbackReason = "Windows PowerShell 5.1 or later is required for the reset window."
+}
 
 function Write-Log {
     param([string]$Message)
     $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$stamp] $Message"
     Write-Host $line
+    if ($script:resetUi) {
+        $script:resetUi.ProgressLog.AppendText($line + [Environment]::NewLine)
+        $script:resetUi.ProgressLog.SelectionStart = $script:resetUi.ProgressLog.TextLength
+        $script:resetUi.ProgressLog.ScrollToCaret()
+        $script:resetUi.StatusLabel.Text = $Message
+        $script:resetUi.OpenLogButton.Enabled = -not [string]::IsNullOrWhiteSpace($script:logFile) -and [IO.File]::Exists($script:logFile)
+        [System.Windows.Forms.Application]::DoEvents()
+    }
     if ($script:loggingEnabled) {
         Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 -ErrorAction Stop
     }
@@ -213,6 +242,119 @@ function Invoke-MySqlAuthenticationProbe {
     } finally {
         $env:MYSQL_PWD = $null
         $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+function Get-MySqlListeningProcessIds {
+    param([Parameter(Mandatory = $true)][int]$Port)
+
+    $listeners = @(Get-CimInstance `
+        -Namespace "ROOT/StandardCimv2" `
+        -ClassName "MSFT_NetTCPConnection" `
+        -Filter "LocalPort = $Port AND State = 2" `
+        -ErrorAction Stop)
+    return @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
+}
+
+function Assert-MySqlTemporaryServerOwnsPort {
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [Parameter(Mandatory = $true)][int]$ExpectedProcessId,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutablePath,
+        [Parameter(Mandatory = $true)][string]$InitFilePath,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][int[]]$ListenerProcessIds,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Processes
+    )
+
+    $ownerIds = @($ListenerProcessIds | Select-Object -Unique)
+    if ($ownerIds.Count -eq 0) {
+        return $false
+    }
+    if ($ownerIds.Count -gt 1) {
+        throw "MySQL port $Port has multiple listener process owners ($($ownerIds -join ', ')); expected one temporary server."
+    }
+
+    $expectedExecutable = [IO.Path]::GetFullPath($ExpectedExecutablePath)
+    $expectedInitFile = [IO.Path]::GetFullPath($InitFilePath)
+    $launchProcess = @($Processes | Where-Object { $_.ProcessId -eq $ExpectedProcessId } | Select-Object -First 1)
+    if ($launchProcess.Count -ne 1 -or
+        -not [string]::Equals([IO.Path]::GetFullPath([string]$launchProcess[0].ExecutablePath), $expectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "MySQL port $Port is owned by PID $($ownerIds[0]), not owned by the launched temporary server PID $ExpectedProcessId."
+    }
+
+    $initFileMatch = [regex]::Match(
+        [string]$launchProcess[0].CommandLine,
+        '(?i)(?:^|\s)--init-file=(?:"([^"]+)"|(\S+))'
+    )
+    $actualInitFile = if ($initFileMatch.Groups[1].Success) {
+        $initFileMatch.Groups[1].Value
+    } else {
+        $initFileMatch.Groups[2].Value
+    }
+    if (-not $initFileMatch.Success -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath($actualInitFile.Replace('/', '\')),
+            $expectedInitFile,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "Launched mysqld PID $ExpectedProcessId does not have the expected init-file argument."
+    }
+
+    $currentProcessId = [int]$ownerIds[0]
+    $ancestry = New-Object System.Collections.Generic.List[int]
+    for ($depth = 0; $depth -lt 32 -and $currentProcessId -gt 0; $depth++) {
+        $ancestry.Add($currentProcessId)
+        $currentProcess = @($Processes | Where-Object { $_.ProcessId -eq $currentProcessId } | Select-Object -First 1)
+        if ($currentProcess.Count -ne 1 -or
+            [string]::IsNullOrWhiteSpace([string]$currentProcess[0].ExecutablePath) -or
+            -not [string]::Equals([IO.Path]::GetFullPath([string]$currentProcess[0].ExecutablePath), $expectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        if ($currentProcessId -eq $ExpectedProcessId) {
+            return $true
+        }
+        $currentProcessId = [int]$currentProcess[0].ParentProcessId
+    }
+
+    throw "MySQL port $Port owner PID $($ownerIds[0]) has ancestry $($ancestry -join ' -> '), which does not match the launched temporary server PID $ExpectedProcessId."
+}
+
+function Test-MySqlProcessBelongsToService {
+    param(
+        [Parameter(Mandatory = $true)][int]$ServiceProcessId,
+        [Parameter(Mandatory = $true)][int]$ListenerProcessId,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Processes
+    )
+
+    $currentProcessId = $ListenerProcessId
+    for ($depth = 0; $depth -lt 32 -and $currentProcessId -gt 0; $depth++) {
+        if ($currentProcessId -eq $ServiceProcessId) {
+            return $true
+        }
+        $currentProcess = @($Processes | Where-Object { $_.ProcessId -eq $currentProcessId } | Select-Object -First 1)
+        if ($currentProcess.Count -ne 1) {
+            return $false
+        }
+        $currentProcessId = [int]$currentProcess[0].ParentProcessId
+    }
+    return $false
+}
+
+function Assert-MySqlServiceOwnsPort {
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [Parameter(Mandatory = $true)][int]$ServiceProcessId,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][int[]]$ListenerProcessIds,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Processes
+    )
+
+    $ownerIds = @($ListenerProcessIds | Select-Object -Unique)
+    if ($ownerIds.Count -eq 0) {
+        throw "No process is listening on MySQL port $Port for service '$ServiceProcessId'."
+    }
+    if ($ownerIds.Count -ne 1 -or
+        -not (Test-MySqlProcessBelongsToService -ServiceProcessId $ServiceProcessId -ListenerProcessId $ownerIds[0] -Processes $Processes)) {
+        throw "MySQL port $Port is owned by PID(s) $($ownerIds -join ', '), not owned by service PID $ServiceProcessId."
     }
 }
 
@@ -688,6 +830,498 @@ function Show-MySqlUpdateDialog {
     }
 }
 
+function Set-MySqlResetTheme {
+    param([Parameter(Mandatory = $true)]$Ui)
+
+    if ($Ui.ThemeToggle.Checked) {
+        $background = [System.Drawing.Color]::FromArgb(28, 36, 46)
+        $headerBackground = [System.Drawing.Color]::FromArgb(20, 32, 46)
+        $text = [System.Drawing.Color]::FromArgb(235, 240, 246)
+        $inputBackground = [System.Drawing.Color]::FromArgb(42, 53, 66)
+        $inputText = [System.Drawing.Color]::FromArgb(245, 247, 250)
+        $secondaryText = [System.Drawing.Color]::FromArgb(190, 201, 213)
+        $logBackground = [System.Drawing.Color]::FromArgb(20, 27, 36)
+        $accent = [System.Drawing.Color]::FromArgb(93, 218, 191)
+        $success = [System.Drawing.Color]::FromArgb(101, 220, 164)
+        $failure = [System.Drawing.Color]::FromArgb(255, 129, 120)
+    } else {
+        $background = [System.Drawing.Color]::FromArgb(245, 247, 250)
+        $headerBackground = [System.Drawing.Color]::FromArgb(24, 43, 62)
+        $text = [System.Drawing.Color]::FromArgb(34, 49, 63)
+        $inputBackground = [System.Drawing.Color]::White
+        $inputText = [System.Drawing.Color]::FromArgb(35, 47, 60)
+        $secondaryText = [System.Drawing.Color]::FromArgb(73, 87, 101)
+        $logBackground = [System.Drawing.Color]::White
+        $accent = [System.Drawing.Color]::FromArgb(0, 105, 100)
+        $success = [System.Drawing.Color]::FromArgb(0, 105, 74)
+        $failure = [System.Drawing.Color]::FromArgb(160, 55, 45)
+    }
+
+    $Ui.Form.BackColor = $background
+    $Ui.Header.BackColor = $headerBackground
+    $Ui.ThemeToggle.BackColor = $headerBackground
+    $Ui.ThemeToggle.ForeColor = [System.Drawing.Color]::White
+    foreach ($label in @($Ui.ServiceLabel, $Ui.PasswordLabel, $Ui.ConfirmPasswordLabel, $Ui.StatusLabel)) {
+        $label.ForeColor = $text
+    }
+    $Ui.StatusLabel.ForeColor = $accent
+    $Ui.ServiceSelector.BackColor = $inputBackground
+    $Ui.ServiceSelector.ForeColor = $inputText
+    foreach ($input in @($Ui.PasswordBox, $Ui.ConfirmPasswordBox)) {
+        $input.BackColor = $inputBackground
+        $input.ForeColor = $inputText
+    }
+    $Ui.ConfirmationCheckBox.ForeColor = $text
+    foreach ($button in @($Ui.CancelButton, $Ui.OpenLogButton)) {
+        $button.BackColor = $inputBackground
+        $button.ForeColor = $inputText
+        $button.UseVisualStyleBackColor = $false
+    }
+    $Ui.ResultLabel.ForeColor = if ($Ui.State.Completed) {
+        if ($Ui.State.ResultSuccess) { $success } else { $failure }
+    } else {
+        $text
+    }
+    $Ui.ResultDetails.BackColor = $background
+    $Ui.ResultDetails.ForeColor = $secondaryText
+    $Ui.ProgressLog.BackColor = $logBackground
+    $Ui.ProgressLog.ForeColor = $inputText
+}
+
+function New-MySqlResetForm {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$ServiceNames,
+        [string]$InitialServiceName = ""
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "MySQL Password Reset"
+    $form.ClientSize = New-Object System.Drawing.Size(700, 690)
+    $form.MinimumSize = New-Object System.Drawing.Size(700, 690)
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $true
+    $form.BackColor = [System.Drawing.Color]::FromArgb(245, 247, 250)
+    $form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = [System.Windows.Forms.DockStyle]::Top
+    $header.Height = 82
+    $header.BackColor = [System.Drawing.Color]::FromArgb(24, 43, 62)
+    $form.Controls.Add($header)
+
+    $themeToggle = New-Object System.Windows.Forms.CheckBox
+    $themeToggle.Text = "Dark mode"
+    $themeToggle.Checked = $true
+    $themeToggle.Location = New-Object System.Drawing.Point(545, 12)
+    $themeToggle.Size = New-Object System.Drawing.Size(130, 28)
+    $themeToggle.ForeColor = [System.Drawing.Color]::White
+    $themeToggle.BackColor = $header.BackColor
+    $themeToggle.UseVisualStyleBackColor = $false
+    $themeToggle.AccessibleName = "Toggle dark mode"
+    $header.Controls.Add($themeToggle)
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "Reset MySQL root password"
+    $title.ForeColor = [System.Drawing.Color]::White
+    $title.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 16)
+    $title.Location = New-Object System.Drawing.Point(26, 13)
+    $title.Size = New-Object System.Drawing.Size(500, 32)
+    $header.Controls.Add($title)
+
+    $subtitle = New-Object System.Windows.Forms.Label
+    $subtitle.Text = "Choose a local service. The reset will target root@localhost only."
+    $subtitle.ForeColor = [System.Drawing.Color]::FromArgb(215, 225, 235)
+    $subtitle.Location = New-Object System.Drawing.Point(28, 49)
+    $subtitle.Size = New-Object System.Drawing.Size(620, 22)
+    $header.Controls.Add($subtitle)
+
+    $serviceLabel = New-Object System.Windows.Forms.Label
+    $serviceLabel.Text = "MySQL Windows service"
+    $serviceLabel.Location = New-Object System.Drawing.Point(28, 101)
+    $serviceLabel.Size = New-Object System.Drawing.Size(620, 22)
+    $serviceLabel.AccessibleName = "MySQL service label"
+    $form.Controls.Add($serviceLabel)
+
+    $serviceSelector = New-Object System.Windows.Forms.ComboBox
+    $serviceSelector.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $serviceSelector.Location = New-Object System.Drawing.Point(28, 125)
+    $serviceSelector.Size = New-Object System.Drawing.Size(644, 30)
+    $serviceSelector.AccessibleName = "MySQL Windows service"
+    foreach ($serviceName in $ServiceNames) {
+        $serviceItem = [pscustomobject]@{
+            Name = $serviceName
+            DisplayText = $serviceName
+        }
+        $null = $serviceSelector.Items.Add($serviceItem)
+    }
+    $serviceSelector.DisplayMember = "DisplayText"
+    $serviceSelector.ValueMember = "Name"
+    if ($ServiceNames.Count -gt 1) {
+        $serviceSelector.SelectedIndex = 0
+        if ($InitialServiceName) {
+            $initialIndex = [Array]::IndexOf($ServiceNames, $InitialServiceName)
+            if ($initialIndex -ge 0) { $serviceSelector.SelectedIndex = $initialIndex }
+        }
+    } elseif ($ServiceNames.Count -eq 1) {
+        $serviceSelector.SelectedIndex = 0
+        $serviceSelector.Enabled = $false
+    }
+    $form.Controls.Add($serviceSelector)
+
+    $passwordLabel = New-Object System.Windows.Forms.Label
+    $passwordLabel.Text = "New password (at least 8 printable ASCII characters)"
+    $passwordLabel.Location = New-Object System.Drawing.Point(28, 171)
+    $passwordLabel.Size = New-Object System.Drawing.Size(644, 22)
+    $form.Controls.Add($passwordLabel)
+
+    $passwordBox = New-Object System.Windows.Forms.TextBox
+    $passwordBox.Location = New-Object System.Drawing.Point(28, 195)
+    $passwordBox.Size = New-Object System.Drawing.Size(644, 28)
+    $passwordBox.UseSystemPasswordChar = $true
+    $passwordBox.AccessibleName = "New MySQL root password"
+    $form.Controls.Add($passwordBox)
+
+    $confirmPasswordLabel = New-Object System.Windows.Forms.Label
+    $confirmPasswordLabel.Text = "Confirm new password"
+    $confirmPasswordLabel.Location = New-Object System.Drawing.Point(28, 235)
+    $confirmPasswordLabel.Size = New-Object System.Drawing.Size(644, 22)
+    $form.Controls.Add($confirmPasswordLabel)
+
+    $confirmPasswordBox = New-Object System.Windows.Forms.TextBox
+    $confirmPasswordBox.Location = New-Object System.Drawing.Point(28, 259)
+    $confirmPasswordBox.Size = New-Object System.Drawing.Size(644, 28)
+    $confirmPasswordBox.UseSystemPasswordChar = $true
+    $confirmPasswordBox.AccessibleName = "Confirm new MySQL root password"
+    $form.Controls.Add($confirmPasswordBox)
+
+    $confirmationCheckBox = New-Object System.Windows.Forms.CheckBox
+    $confirmationCheckBox.Text = "I confirm this will reset root@localhost for the selected service."
+    $confirmationCheckBox.Location = New-Object System.Drawing.Point(28, 303)
+    $confirmationCheckBox.Size = New-Object System.Drawing.Size(644, 30)
+    $confirmationCheckBox.AccessibleName = "Confirm password reset"
+    $form.Controls.Add($confirmationCheckBox)
+
+    $resetButton = New-Object System.Windows.Forms.Button
+    $resetButton.Text = "Reset password"
+    $resetButton.Size = New-Object System.Drawing.Size(155, 38)
+    $resetButton.Location = New-Object System.Drawing.Point(517, 350)
+    $resetButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $resetButton.FlatAppearance.BorderSize = 0
+    $resetButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 115)
+    $resetButton.ForeColor = [System.Drawing.Color]::White
+    $resetButton.AccessibleName = "Start MySQL root password reset"
+    $form.Controls.Add($resetButton)
+    $form.AcceptButton = $resetButton
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Size = New-Object System.Drawing.Size(96, 38)
+    $cancelButton.Location = New-Object System.Drawing.Point(411, 350)
+    $cancelButton.AccessibleName = "Cancel or close password reset"
+    $form.Controls.Add($cancelButton)
+    $form.CancelButton = $cancelButton
+
+    $openLogButton = New-Object System.Windows.Forms.Button
+    $openLogButton.Text = "Open reset log"
+    $openLogButton.Size = New-Object System.Drawing.Size(124, 38)
+    $openLogButton.Location = New-Object System.Drawing.Point(28, 350)
+    $openLogButton.Enabled = $false
+    $openLogButton.AccessibleName = "Open reset log in Notepad"
+    $form.Controls.Add($openLogButton)
+
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Text = "Ready. Enter and confirm a password, then confirm the reset."
+    $statusLabel.Location = New-Object System.Drawing.Point(28, 405)
+    $statusLabel.Size = New-Object System.Drawing.Size(644, 26)
+    $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 105, 100)
+    $statusLabel.AutoEllipsis = $true
+    $statusLabel.AccessibleName = "Reset progress status"
+    $form.Controls.Add($statusLabel)
+
+    $resultLabel = New-Object System.Windows.Forms.Label
+    $resultLabel.Location = New-Object System.Drawing.Point(28, 435)
+    $resultLabel.Size = New-Object System.Drawing.Size(644, 25)
+    $resultLabel.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
+    $resultLabel.Visible = $false
+    $resultLabel.AccessibleName = "Reset result"
+    $form.Controls.Add($resultLabel)
+
+    $resultDetails = New-Object System.Windows.Forms.TextBox
+    $resultDetails.Location = New-Object System.Drawing.Point(28, 461)
+    $resultDetails.Size = New-Object System.Drawing.Size(644, 56)
+    $resultDetails.Multiline = $true
+    $resultDetails.ReadOnly = $true
+    $resultDetails.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $resultDetails.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $resultDetails.ForeColor = [System.Drawing.Color]::FromArgb(73, 87, 101)
+    $resultDetails.BackColor = $form.BackColor
+    $resultDetails.Visible = $false
+    $resultDetails.AccessibleName = "Reset result details"
+    $form.Controls.Add($resultDetails)
+
+    $progressBar = New-Object System.Windows.Forms.ProgressBar
+    $progressBar.Location = New-Object System.Drawing.Point(28, 520)
+    $progressBar.Size = New-Object System.Drawing.Size(644, 16)
+    $progressBar.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
+    $form.Controls.Add($progressBar)
+
+    $progressLog = New-Object System.Windows.Forms.RichTextBox
+    $progressLog.Location = New-Object System.Drawing.Point(28, 548)
+    $progressLog.Size = New-Object System.Drawing.Size(644, 114)
+    $progressLog.ReadOnly = $true
+    $progressLog.WordWrap = $false
+    $progressLog.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Both
+    $progressLog.Font = New-Object System.Drawing.Font("Consolas", 8.5)
+    $progressLog.BackColor = [System.Drawing.Color]::White
+    $progressLog.AccessibleName = "Reset progress log"
+    $form.Controls.Add($progressLog)
+
+    $state = [pscustomobject]@{
+        Submitted = $false
+        Cancelled = $false
+        InProgress = $false
+        Completed = $false
+        ResultSuccess = $false
+        ServiceName = $null
+        SecurePassword = $null
+    }
+    $ui = [pscustomobject]@{
+        Form = $form
+        State = $state
+        ServiceSelector = $serviceSelector
+        Header = $header
+        ThemeToggle = $themeToggle
+        ServiceLabel = $serviceLabel
+        PasswordLabel = $passwordLabel
+        ConfirmPasswordLabel = $confirmPasswordLabel
+        PasswordBox = $passwordBox
+        ConfirmPasswordBox = $confirmPasswordBox
+        ConfirmationCheckBox = $confirmationCheckBox
+        ResetButton = $resetButton
+        CancelButton = $cancelButton
+        OpenLogButton = $openLogButton
+        StatusLabel = $statusLabel
+        ResultLabel = $resultLabel
+        ResultDetails = $resultDetails
+        ProgressBar = $progressBar
+        ProgressLog = $progressLog
+    }
+
+    $themeToggle.Add_CheckedChanged({
+        Set-MySqlResetTheme -Ui $ui
+    }.GetNewClosure())
+    Set-MySqlResetTheme -Ui $ui
+
+    $resetButton.Add_Click({
+        $null = Submit-MySqlResetForm -Ui $ui
+    }.GetNewClosure())
+    $cancelButton.Add_Click({
+        if ($ui.State.Completed) {
+            $form.Close()
+        } elseif (-not $ui.State.InProgress) {
+            $ui.State.Cancelled = $true
+            $form.Close()
+        }
+    }.GetNewClosure())
+    $openLogButton.Add_Click({
+        if ([string]::IsNullOrWhiteSpace($script:logFile) -or -not [IO.File]::Exists($script:logFile)) {
+            $ui.StatusLabel.Text = "The reset log is not available yet."
+            return
+        }
+        try {
+            Start-Process -FilePath "notepad.exe" -ArgumentList "`"$script:logFile`"" -ErrorAction Stop | Out-Null
+        } catch {
+            $ui.StatusLabel.Text = "Could not open the reset log: $($_.Exception.Message)"
+        }
+    }.GetNewClosure())
+    $form.Add_FormClosing({
+        param($sender, $eventArgs)
+        if ($ui.State.InProgress -and -not $ui.State.Completed) {
+            $eventArgs.Cancel = $true
+            $ui.StatusLabel.Text = "Reset is in progress. Wait for the result before closing this window."
+        } elseif (-not $ui.State.Submitted) {
+            $ui.State.Cancelled = $true
+        }
+    }.GetNewClosure())
+
+    return $ui
+}
+
+function Submit-MySqlResetForm {
+    param([Parameter(Mandatory = $true)]$Ui)
+
+    if ($Ui.ServiceSelector.SelectedIndex -lt 0) {
+        $Ui.StatusLabel.Text = "Choose the MySQL service to reset."
+        return $false
+    }
+    if (-not $Ui.ConfirmationCheckBox.Checked) {
+        $Ui.StatusLabel.Text = "Confirm that you want to reset root@localhost."
+        return $false
+    }
+
+    $password = $Ui.PasswordBox.Text
+    $confirmation = $Ui.ConfirmPasswordBox.Text
+    if ($password -cne $confirmation) {
+        $Ui.ConfirmPasswordBox.Clear()
+        $null = $Ui.ConfirmPasswordBox.Focus()
+        $Ui.StatusLabel.Text = "Passwords do not match. Confirm the new password again."
+        return $false
+    }
+    try {
+        Assert-ResetPassword -Password $password
+    } catch {
+        $Ui.PasswordBox.Clear()
+        $Ui.ConfirmPasswordBox.Clear()
+        $null = $Ui.PasswordBox.Focus()
+        $Ui.StatusLabel.Text = $_.Exception.Message
+        return $false
+    }
+
+    try {
+        $Ui.State.SecurePassword = ConvertTo-SecureString -String $password -AsPlainText -Force -ErrorAction Stop
+    } catch {
+        $Ui.PasswordBox.Clear()
+        $Ui.ConfirmPasswordBox.Clear()
+        $Ui.StatusLabel.Text = "Could not securely prepare the password. Try again."
+        return $false
+    } finally {
+        $password = $null
+        $confirmation = $null
+        $Ui.PasswordBox.Clear()
+        $Ui.ConfirmPasswordBox.Clear()
+    }
+
+    $Ui.State.ServiceName = [string]$Ui.ServiceSelector.SelectedItem.Name
+    $Ui.State.Submitted = $true
+    $Ui.State.InProgress = $true
+    $Ui.ServiceSelector.Enabled = $false
+    $Ui.ConfirmationCheckBox.Enabled = $false
+    $Ui.ResetButton.Enabled = $false
+    $Ui.CancelButton.Enabled = $false
+    $Ui.Form.AcceptButton = $null
+    $Ui.StatusLabel.Text = "Starting preflight checks..."
+    $Ui.ProgressBar.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+    $Ui.ProgressBar.MarqueeAnimationSpeed = 24
+    return $true
+}
+
+function Set-MySqlResetConsoleWindowVisibility {
+    param([Parameter(Mandatory = $true)][bool]$Visible)
+
+    if (-not ("MySqlResetConsoleWindow" -as [type])) {
+        $typeDefinition = @"
+using System;
+using System.Runtime.InteropServices;
+public static class MySqlResetConsoleWindow {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr windowHandle, int command);
+}
+"@
+        Add-Type -TypeDefinition $typeDefinition -ErrorAction Stop | Out-Null
+    }
+
+    $windowHandle = [MySqlResetConsoleWindow]::GetConsoleWindow()
+    if ($windowHandle -eq [IntPtr]::Zero) {
+        return $false
+    }
+    $command = if ($Visible) { 5 } else { 0 }
+    $null = [MySqlResetConsoleWindow]::ShowWindow($windowHandle, $command)
+    return $true
+}
+
+function Show-MySqlResetForm {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$ServiceNames,
+        [string]$InitialServiceName = ""
+    )
+
+    $ui = New-MySqlResetForm -ServiceNames $ServiceNames -InitialServiceName $InitialServiceName
+    $script:resetUi = $ui
+    try {
+        $ui.Form.Show()
+        $ui.Form.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            if (-not (Set-MySqlResetConsoleWindowVisibility -Visible:$false)) {
+                throw "No console window handle is available."
+            }
+        } catch {
+            $ui.StatusLabel.Text = "Reset window is open, but the terminal could not be hidden: $($_.Exception.Message)"
+            Write-Host "[WARN] $($ui.StatusLabel.Text)" -ForegroundColor Yellow
+        }
+        while ($ui.Form.Visible -and -not $ui.State.Submitted -and -not $ui.State.Cancelled) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not $ui.State.Submitted) {
+            return $null
+        }
+        return $ui
+    } finally {
+        if (-not $ui.State.Submitted) {
+            $ui.Form.Dispose()
+            $script:resetUi = $null
+        }
+    }
+}
+
+function Show-MySqlResetUiResult {
+    param(
+        [Parameter(Mandatory = $true)][bool]$Success,
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Details
+    )
+
+    if (-not $script:resetUi) {
+        if (-not $script:resetUiEnabled) {
+            Write-Host "$Title`r`n$Details" -ForegroundColor $(if ($Success) { "Green" } else { "Red" })
+            return
+        }
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $icon = if ($Success) { [System.Windows.Forms.MessageBoxIcon]::Information } else { [System.Windows.Forms.MessageBoxIcon]::Error }
+        $null = [System.Windows.Forms.MessageBox]::Show($Details, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, $icon)
+        return
+    }
+
+    $ui = $script:resetUi
+    $ui.State.InProgress = $false
+    $ui.State.Completed = $true
+    $ui.State.ResultSuccess = $Success
+    $ui.ProgressBar.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
+    $ui.ProgressBar.MarqueeAnimationSpeed = 0
+    $ui.ProgressBar.Value = if ($Success) { 100 } else { 0 }
+    $ui.ResultLabel.Text = $Title
+    $ui.ResultDetails.Text = $Details
+    $ui.ResultLabel.Visible = $true
+    $ui.ResultDetails.Visible = $true
+    $ui.StatusLabel.Text = if ($Success) { "Reset completed successfully." } else { "Reset failed. Review the reason below and the log." }
+    $ui.ResetButton.Visible = $false
+    $ui.CancelButton.Text = "Close"
+    $ui.CancelButton.Enabled = $true
+    $ui.Form.AcceptButton = $ui.CancelButton
+    $ui.Form.CancelButton = $ui.CancelButton
+    $ui.OpenLogButton.Enabled = -not [string]::IsNullOrWhiteSpace($script:logFile) -and [IO.File]::Exists($script:logFile)
+    Set-MySqlResetTheme -Ui $ui
+    $ui.Form.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
+    while ($ui.Form.Visible) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 50
+    }
+    $ui.Form.Dispose()
+    $script:resetUi = $null
+}
+
 function Test-MySqlServiceImagePath {
     param(
         [string]$ImagePath,
@@ -731,6 +1365,13 @@ function Fail-WithReport {
 
     $script:plainPass = $null
     $env:MYSQL_PWD = $null
+    if ($script:resetSecurePassword) {
+        $script:resetSecurePassword.Dispose()
+        $script:resetSecurePassword = $null
+    }
+    if ($script:resetUi) {
+        $script:resetUi.State.SecurePassword = $null
+    }
 
     if ($initFile -and (Test-Path -LiteralPath $initFile)) {
         try {
@@ -761,14 +1402,20 @@ function Fail-WithReport {
     }
 
     Write-Host "======================================================================" -ForegroundColor Red
-    Wait-ForResult
+    if ($script:resetUiEnabled) {
+        $failureDetails = "Failed step: $Step`r`nExit code: $ExitCode`r`nReason: $Reason`r`nSuggested fix: $Fix`r`nAudit log: $logFile"
+        Show-MySqlResetUiResult -Success:$false -Title "Reset failed: $Step" -Details $failureDetails
+    } else {
+        Wait-ForResult
+    }
     exit $ExitCode
 }
 
 Write-Log "=== MySQL Password Reset Started ==="
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $Preflight -and -not $SkipUpdateCheck -and -not $Elevated) {
+if (-not $Preflight -and -not $SkipUpdateCheck -and -not $Elevated -and
+    (Test-MySqlResetUiSupported -PowerShellVersion $PSVersionTable.PSVersion)) {
     if ($isAdmin) {
         Write-Log "[INFO] Skipping automatic update checks because this process is already elevated."
     } else {
@@ -791,6 +1438,10 @@ if (-not $Preflight -and -not $SkipUpdateCheck -and -not $Elevated) {
             Write-Log "[WARN] Update check failed; continuing with version $script:appVersion. $($_.Exception.Message)"
         }
     }
+}
+elseif (-not $Preflight -and -not $SkipUpdateCheck -and
+    -not (Test-MySqlResetUiSupported -PowerShellVersion $PSVersionTable.PSVersion)) {
+    Write-Log "[INFO] Skipping update checks because the installed PowerShell version uses the console reset workflow."
 }
 
 if (-not $isAdmin -and -not $Preflight) {
@@ -818,6 +1469,7 @@ if (-not $isAdmin -and -not $Preflight) {
         if ($ServiceName) { $argList += @("-ServiceName", "`"$ServiceName`"") }
         if ($MySqlBin) { $argList += @("-MySqlBin", "`"$MySqlBin`"") }
         if ($DefaultsFile) { $argList += @("-DefaultsFile", "`"$DefaultsFile`"") }
+        if ($Console) { $argList += "-Console" }
         if ($NoWait) { $argList += "-NoWait" }
 
         $elevatedProcess = Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs -Wait -PassThru -ErrorAction Stop
@@ -834,8 +1486,59 @@ if ($isAdmin) {
 }
 
 try {
-    if (-not $ServiceName) {
+    if ($ServiceName) {
+        $serviceNames = @(Get-Service -Name "mysql*" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+        $requestedServices = @(Get-Service -Name $ServiceName -ErrorAction Stop)
+        if ($requestedServices.Count -ne 1 -or $requestedServices[0].Name -ine $ServiceName) {
+            throw "Service name '$ServiceName' must identify exactly one MySQL Windows service."
+        }
+        $ServiceName = $requestedServices[0].Name
+        if ($serviceNames -notcontains $ServiceName) {
+            $serviceNames += $ServiceName
+        }
+    } else {
         $serviceNames = @(Get-Service -Name "mysql*" -ErrorAction Stop | Select-Object -ExpandProperty Name)
+    }
+
+    if (-not $Preflight -and -not $Console) {
+        if ($serviceNames.Count -eq 0) {
+            throw "No Windows service starting with 'mysql' was found."
+        }
+        if ($script:resetUiEnabled) {
+            try {
+                $script:resetUi = Show-MySqlResetForm -ServiceNames $serviceNames -InitialServiceName $ServiceName
+            } catch {
+                if ($script:resetUi -and $script:resetUi.State.Submitted) {
+                    throw
+                }
+                $script:resetUiEnabled = $false
+                $script:resetUiFallbackReason = "The reset window could not be opened: $($_.Exception.Message)"
+                try {
+                    if (-not (Set-MySqlResetConsoleWindowVisibility -Visible:$true)) {
+                        throw "No console window handle is available."
+                    }
+                } catch {
+                    Write-Host "[WARN] Could not restore the terminal for console fallback: $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
+        }
+        if ($script:resetUi) {
+            $ServiceName = $script:resetUi.State.ServiceName
+            $script:resetSecurePassword = $script:resetUi.State.SecurePassword
+        } elseif ($script:resetUiEnabled) {
+            Write-Log "[ABORT] Cancelled by user. No password changes were made."
+            exit 0
+        } else {
+            Write-Log "[WARN] $script:resetUiFallbackReason Falling back to console prompts."
+            if (-not $ServiceName) {
+                if ($serviceNames.Count -gt 1) {
+                    $ServiceName = Select-MySqlServiceName -ServiceNames $serviceNames
+                } else {
+                    $ServiceName = Resolve-MySqlServiceName -ServiceNames $serviceNames
+                }
+            }
+        }
+    } elseif (-not $ServiceName) {
         if ($serviceNames.Count -gt 1 -and -not $Preflight) {
             $ServiceName = Select-MySqlServiceName -ServiceNames $serviceNames
         } else {
@@ -967,54 +1670,76 @@ if ($DefaultsFile) { Write-Host "Config File    : $DefaultsFile" }
 Write-Host "Audit Log      : $logFile"
 Write-Host ""
 
-while ($true) {
-    $sec1 = Read-Host "Enter new MySQL root password (min 8 printable ASCII characters)" -AsSecureString
-    $sec2 = Read-Host "Confirm new MySQL root password" -AsSecureString
-
-    $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec1)
-    $b2 = [IntPtr]::Zero
+if ($script:resetUi) {
+    $passwordBstr = [IntPtr]::Zero
     try {
-        $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec2)
-        $p1 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b1)
-        $p2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b2)
-    } finally {
-        if ($b1 -ne [IntPtr]::Zero) {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1)
-        }
-        if ($b2 -ne [IntPtr]::Zero) {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2)
-        }
-        $sec1.Dispose()
-        $sec2.Dispose()
-    }
-
-    if ($p1 -ne $p2) {
-        Write-Host "[ERROR] Passwords do not match. Try again." -ForegroundColor Red
-        $p1 = $null
-        $p2 = $null
-        continue
-    }
-    try {
-        Assert-ResetPassword -Password $p1
+        $passwordBstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($script:resetSecurePassword)
+        $script:plainPass = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr)
+        Assert-ResetPassword -Password $script:plainPass
     } catch {
-        Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+        Fail-WithReport -Step "Step 4: Validate Reset Password" -ExitCode 1 -Reason $_.Exception.Message -Fix "Close the result window and retry with a valid password."
+    } finally {
+        if ($passwordBstr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr)
+        }
+        if ($script:resetSecurePassword) {
+            $script:resetSecurePassword.Dispose()
+            $script:resetSecurePassword = $null
+            $script:resetUi.State.SecurePassword = $null
+        }
+    }
+} else {
+    while ($true) {
+        $sec1 = Read-Host "Enter new MySQL root password (min 8 printable ASCII characters)" -AsSecureString
+        $sec2 = Read-Host "Confirm new MySQL root password" -AsSecureString
+
+        $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec1)
+        $b2 = [IntPtr]::Zero
+        try {
+            $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec2)
+            $p1 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b1)
+            $p2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b2)
+        } finally {
+            if ($b1 -ne [IntPtr]::Zero) {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1)
+            }
+            if ($b2 -ne [IntPtr]::Zero) {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2)
+            }
+            $sec1.Dispose()
+            $sec2.Dispose()
+        }
+
+        if ($p1 -ne $p2) {
+            Write-Host "[ERROR] Passwords do not match. Try again." -ForegroundColor Red
+            $p1 = $null
+            $p2 = $null
+            continue
+        }
+        try {
+            Assert-ResetPassword -Password $p1
+        } catch {
+            Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+            $p1 = $null
+            $p2 = $null
+            continue
+        }
+
+        $script:plainPass = $p1
         $p1 = $null
         $p2 = $null
-        continue
+        break
     }
-
-    $script:plainPass = $p1
-    $p1 = $null
-    $p2 = $null
-    break
 }
 
-$confirm = Read-Host "Stop '$ServiceName' and reset root password now? [Y/N]"
-if ($confirm -notmatch '^[Yy]$') {
-    Write-Log "[ABORT] Cancelled by user. No password changes were made."
-    $script:plainPass = $null
-    Wait-ForResult
-    exit 0
+if (-not $script:resetUi) {
+    $confirm = Read-Host "Stop '$ServiceName' and reset root password now? [Y/N]"
+    if ($confirm -notmatch '^[Yy]$') {
+        Write-Log "[ABORT] Cancelled by user. No password changes were made."
+        $script:plainPass = $null
+        Wait-ForResult
+        exit 0
+    }
 }
 
 try {
@@ -1048,6 +1773,10 @@ try {
     $mysqldExe = Join-Path $MySqlBin "mysqld.exe"
     $mysqlExe = Join-Path $MySqlBin "mysql.exe"
     $mysqlAdminExe = Join-Path $MySqlBin "mysqladmin.exe"
+    $existingListenerProcessIds = @(Get-MySqlListeningProcessIds -Port $dbPort)
+    if ($existingListenerProcessIds.Count -gt 0) {
+        throw "TCP port $dbPort is already in use by process ID(s) $($existingListenerProcessIds -join ', '). Stop every MySQL service using this port and retry."
+    }
     $initArg = $initFile -replace '\\', '/'
 
     $mysqldArgs = Get-MySqlServerArguments -DefaultsFile $DefaultsFile -InitFile $initArg
@@ -1061,6 +1790,18 @@ try {
         Start-Sleep -Seconds 1
         if ($script:tempProcess.HasExited) {
             throw "Temporary mysqld.exe exited unexpectedly during startup."
+        }
+        $listenerProcessIds = @(Get-MySqlListeningProcessIds -Port $dbPort)
+        if ($listenerProcessIds.Count -gt 0) {
+            $null = Assert-MySqlTemporaryServerOwnsPort `
+                -Port $dbPort `
+                -ExpectedProcessId $script:tempProcess.Id `
+                -ExpectedExecutablePath $mysqldExe `
+                -InitFilePath $initFile `
+                -ListenerProcessIds $listenerProcessIds `
+                -Processes @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        } else {
+            continue
         }
         $probeResult = Invoke-MySqlAuthenticationProbe `
             -MySqlExe $mysqlExe `
@@ -1083,6 +1824,16 @@ try {
         }
         throw $timeoutReason
     }
+    $listenerProcessIds = @(Get-MySqlListeningProcessIds -Port $dbPort)
+    if (-not (Assert-MySqlTemporaryServerOwnsPort `
+        -Port $dbPort `
+        -ExpectedProcessId $script:tempProcess.Id `
+        -ExpectedExecutablePath $mysqldExe `
+        -InitFilePath $initFile `
+        -ListenerProcessIds $listenerProcessIds `
+        -Processes @(Get-CimInstance Win32_Process -ErrorAction Stop))) {
+        Write-Log "[WARN] Temporary MySQL stopped after the new password was authenticated; proceeding with cleanup."
+    }
     Write-Log "[OK] Verified new root password against temporary mysqld on port $dbPort."
 } catch {
     Fail-WithReport -Step "Step 7: Apply Password via --init-file" -ExitCode 1 -Reason $_.Exception.Message -Fix "Check your MySQL .err log file in the MySQL Data folder for startup errors."
@@ -1090,15 +1841,28 @@ try {
 
 try {
     Write-Log "[INFO] Shutting down temporary mysqld cleanly..."
-    $env:MYSQL_PWD = $script:plainPass
-    & $mysqlAdminExe -h 127.0.0.1 -P $dbPort -u root shutdown >> $logFile 2>&1
-    $shutdownRc = $LASTEXITCODE
-    $env:MYSQL_PWD = $null
-    if ($shutdownRc -ne 0) {
-        throw "mysqladmin shutdown failed with exit code $shutdownRc."
-    }
-    if (-not $script:tempProcess.WaitForExit(20000)) {
-        throw "Temporary mysqld.exe process $($script:tempProcess.Id) did not shut down within 20 seconds."
+    $listenerProcessIds = @(Get-MySqlListeningProcessIds -Port $dbPort)
+    $temporaryServerIsListening = Assert-MySqlTemporaryServerOwnsPort `
+        -Port $dbPort `
+        -ExpectedProcessId $script:tempProcess.Id `
+        -ExpectedExecutablePath $mysqldExe `
+        -InitFilePath $initFile `
+        -ListenerProcessIds $listenerProcessIds `
+        -Processes @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    if ($temporaryServerIsListening) {
+        $env:MYSQL_PWD = $script:plainPass
+        & $mysqlAdminExe -h 127.0.0.1 -P $dbPort -u root shutdown >> $logFile 2>&1
+        $shutdownRc = $LASTEXITCODE
+        $env:MYSQL_PWD = $null
+        if ($shutdownRc -ne 0) {
+            throw "mysqladmin shutdown failed with exit code $shutdownRc."
+        }
+        if (-not $script:tempProcess.WaitForExit(20000)) {
+            throw "Temporary mysqld.exe process $($script:tempProcess.Id) did not shut down within 20 seconds."
+        }
+    } else {
+        Write-Log "[INFO] Temporary MySQL had already stopped after the successful password check."
+        Stop-TemporaryMySqlProcess
     }
     $tempStarted = $false
     Write-Log "[OK] Temporary mysqld shut down cleanly."
@@ -1111,36 +1875,41 @@ try {
 }
 
 try {
-    if ($serviceWasRunning) {
-        Write-Log "[INFO] Restoring service '$ServiceName' to its original Running state..."
-        Start-Service -Name $ServiceName -ErrorAction Stop
-        (Get-Service -Name $ServiceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
-        $serviceStopped = $false
+    Write-Log "[INFO] Starting MySQL service '$ServiceName' and verifying the new password..."
+    Start-Service -Name $ServiceName -ErrorAction Stop
+    (Get-Service -Name $ServiceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+    $serviceStopped = $false
 
-        $env:MYSQL_PWD = $script:plainPass
-        & $mysqlExe -h 127.0.0.1 -P $dbPort -u root -e "SELECT USER(), VERSION();" >> $logFile 2>&1
-        $verRc = $LASTEXITCODE
-        $env:MYSQL_PWD = $null
-        if ($verRc -ne 0) {
-            throw "Service '$ServiceName' started, but post-reset login check failed with exit code $verRc."
-        }
-    } else {
-        Write-Log "[INFO] Service '$ServiceName' was stopped before reset; leaving it stopped."
+    $serviceProcessIds = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.Name -eq $ServiceName } | Select-Object -ExpandProperty ProcessId)
+    if ($serviceProcessIds.Count -ne 1 -or $serviceProcessIds[0] -le 0) {
+        throw "Could not verify the process hosting MySQL service '$ServiceName'."
+    }
+    $listenerProcessIds = @(Get-MySqlListeningProcessIds -Port $dbPort)
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    Assert-MySqlServiceOwnsPort -Port $dbPort -ServiceProcessId $serviceProcessIds[0] -ListenerProcessIds $listenerProcessIds -Processes $processes
+
+    $env:MYSQL_PWD = $script:plainPass
+    & $mysqlExe -h 127.0.0.1 -P $dbPort -u root -e "SELECT USER(), VERSION();" >> $logFile 2>&1
+    $verRc = $LASTEXITCODE
+    $env:MYSQL_PWD = $null
+    if ($verRc -ne 0) {
+        throw "Service '$ServiceName' started, but post-reset login check failed with exit code $verRc."
     }
     $script:plainPass = $null
 
     Write-Log "[SUCCESS] MySQL root password reset and verified."
-    $finalServiceStatus = if ($serviceWasRunning) { "Running" } else { "Stopped" }
     Write-Host ""
     Write-Host "======================================================================" -ForegroundColor Green
     Write-Host "[SUCCESS] Password reset completed for root@localhost." -ForegroundColor Green
-    Write-Host "Service   : $ServiceName ($finalServiceStatus)"
-    if (-not $serviceWasRunning) {
-        Write-Host "Note      : The service was already stopped and remains stopped. Start it in Services before connecting."
-    }
+    Write-Host "Service   : $ServiceName (Running)"
     Write-Host "Audit Log : $logFile"
     Write-Host "======================================================================" -ForegroundColor Green
-    Wait-ForResult
+    if ($script:resetUiEnabled) {
+        $successDetails = "Password reset for root@localhost succeeded and was verified.`r`nService: $ServiceName (Running)`r`nAudit log: $logFile"
+        Show-MySqlResetUiResult -Success:$true -Title "Password reset completed" -Details $successDetails
+    } else {
+        Wait-ForResult
+    }
     exit 0
 } catch {
     Fail-WithReport -Step "Step 9: Start Service & Verify Login" -ExitCode 1 -Reason $_.Exception.Message -Fix "Check Windows Application Event Log and MySQL .err log, then start '$ServiceName'."

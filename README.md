@@ -6,9 +6,10 @@ or remote servers.
 
 ## Requirements and support
 
-- Windows PowerShell 5.1, included with supported Windows client and server
-  installations.
-- Windows Forms, included with Windows PowerShell, for the update dialog.
+- Windows PowerShell 3.0 or later for the reset workflow. Windows PowerShell
+  5.1 or later is required for the graphical reset window and automatic updater.
+- Windows Forms, included with Windows PowerShell, for the reset and update
+  dialogs on 5.1 or later.
 - A local MySQL Windows service with `mysqld.exe`, `mysql.exe`, and
   `mysqladmin.exe` in the same `bin` directory.
 - Administrator approval when the reset is run.
@@ -16,15 +17,23 @@ or remote servers.
   automatic port detection.
 - The new password must be at least 8 printable ASCII characters.
 
+Windows PowerShell versions earlier than 5.1 automatically use the console
+workflow and skip automatic update checks. If the reset window cannot be
+created or displayed, the utility reports the reason and falls back to console
+prompts; cancelling the window or encountering a reset error does not trigger
+fallback. PowerShell earlier than 3.0 is rejected before the embedded script
+is parsed.
+
 The current verified environment is Windows PowerShell 5.1 with MySQL Server
 8.0.46. Other MySQL versions, Windows architectures, and Windows releases need
 validation on the target device before deployment.
 
 ## Automatic updates
 
-On normal startup, the utility checks the latest public GitHub release. When a
-newer supported release is available, a Windows dialog lets you choose **Update
-and reopen** or **Not now**. Updates are never installed silently. The utility
+On normal startup with Windows PowerShell 5.1 or later, the utility checks the
+latest public GitHub release. When a newer supported release is available, a
+Windows dialog lets you choose **Update and reopen** or **Not now**. Updates
+are never installed silently. The utility
 downloads only the `mysql_reset.bat` asset from this repository's HTTPS release
 URL and verifies its size, version, and SHA-256 digest against GitHub release
 metadata before replacing anything.
@@ -62,23 +71,34 @@ select the intended one explicitly with `-ServiceName`.
 .\mysql_reset.bat -ServiceName MySQL80
 ```
 
-You can also double-click `mysql_reset.bat`. If more than one MySQL service is
-found, choose the intended service from the numbered list. When launching from a
-terminal, pass `-ServiceName` explicitly.
+You can also double-click `mysql_reset.bat`. Choose the intended service in the
+reset window; when launching from a terminal, pass `-ServiceName` explicitly to
+preselect it.
 
-Approve the Windows UAC prompt, enter and confirm the new password in the
-elevated PowerShell window, then confirm the reset. The selected service is
-stopped while the password is changed. The script restores its original
-Running/Stopped state and reports explicitly if restoration fails.
+Approve the Windows UAC prompt, then choose the MySQL service, enter and confirm
+the new password, and check the confirmation box in the reset window. The
+progress log stays visible during the reset; **Open reset log** opens the
+restricted audit log in Notepad. The final window reports success or includes
+the failure reason and suggested fix. Close it after reviewing the result.
+The reset window starts in dark mode; use **Dark mode** to switch between dark
+and light themes. After the elevated reset window is displayed, its console is
+hidden so the window remains the primary interface.
+The selected service is stopped while the password is changed. After a
+successful reset, the script starts the service and verifies that the new
+password works, even if the service was stopped before the reset. If a reset
+fails, a service that was running beforehand is restored when possible; a
+service that was already stopped is left stopped.
 
 The script writes its temporary init SQL into a unique per-run directory with
 restricted ACLs and removes the file after use. Passwords are never passed as
 command-line arguments or written to the audit log.
 
-After a reset, cancellation, or failure, the result stays visible until you
-press Enter. A service that was stopped before the reset remains stopped; start
-it in Services before connecting. For scripted runs, pass `-NoWait` to return
-without waiting for a key press. Read-only preflight never waits.
+Use `-Console` to use the original PowerShell prompts instead of the reset
+window. Console mode and compatibility fallback keep the terminal visible. In
+console mode, the result stays visible until you press Enter. A
+successful reset leaves the selected service running and ready for connections.
+For scripted runs, combine `-Console -NoWait` to return without waiting for a
+key press. Read-only preflight never opens the reset UI or waits.
 
 ## Tests
 
@@ -91,7 +111,9 @@ powershell.exe -NoProfile -File .\tests\mysql_reset.tests.ps1
 These checks cover embedded-script parsing, argument quoting, service
 selection (including the interactive service picker), updater release
 validation and safe file replacement, service-account ACL mapping, port
-parsing, and password SQL generation. The read-only batch preflight and MySQL
+parsing, password SQL generation, reset-form validation, compatibility
+fallback, console visibility ordering, dark/light theme toggling, UI progress
+logging, and visible result details. The read-only batch preflight and MySQL
 configuration validator should also be run on each target installation. The
 regression suite does not reset a production database.
 

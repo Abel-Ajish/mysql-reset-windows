@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.0 - 2026-11-25
+
+### Added
+
+- A native reset window with MySQL service selection, masked password entry,
+  explicit confirmation, live progress logging, and persistent success/failure
+  details with audit-log access.
+- `-Console` to retain the original interactive PowerShell reset flow.
+- Dark/light theme toggle and console fallback when the reset window is
+  unsupported or cannot initialize.
+
+### Fixed
+
+- Verify that the reset probe, shutdown, and post-reset login target the
+  expected MySQL process, including a verified child listener.
+- Preserve the confirmed reset result and clean up if the temporary server
+  stops after successfully authenticating the new password.
+- Start and verify the selected MySQL service after every successful reset,
+  even when it was stopped before the reset.
+
 ## 1.1.3 - 2026-11-24
 
 ### Fixed
