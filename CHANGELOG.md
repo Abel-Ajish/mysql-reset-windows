@@ -19,6 +19,8 @@
   stops after successfully authenticating the new password.
 - Start and verify the selected MySQL service after every successful reset,
   even when it was stopped before the reset.
+- Keep the dark/light theme callback bound to its renderer when the UI event
+  runs in a separate PowerShell event scope.
 
 ## 1.1.3 - 2026-11-24
 

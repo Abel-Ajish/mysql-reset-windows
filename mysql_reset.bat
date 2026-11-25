@@ -1115,8 +1115,9 @@ function New-MySqlResetForm {
         ProgressLog = $progressLog
     }
 
+    $themeRenderer = (Get-Command Set-MySqlResetTheme -CommandType Function -ErrorAction Stop).ScriptBlock
     $themeToggle.Add_CheckedChanged({
-        Set-MySqlResetTheme -Ui $ui
+        & $themeRenderer -Ui $ui
     }.GetNewClosure())
     Set-MySqlResetTheme -Ui $ui
 
