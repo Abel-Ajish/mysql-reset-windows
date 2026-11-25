@@ -90,8 +90,26 @@ if (-not $powerShellSource.Contains('$existingListenerProcessIds = @(Get-MySqlLi
     -not $powerShellSource.Contains('if (-not (Assert-MySqlTemporaryServerOwnsPort `') -or
     -not $powerShellSource.Contains('if ($temporaryServerIsListening) {') -or
     -not $powerShellSource.Contains('Temporary MySQL had already stopped after the successful password check.') -or
-    -not $powerShellSource.Contains('Assert-MySqlServiceOwnsPort -Port $dbPort -ServiceProcessId $serviceProcessIds[0]')) {
-    throw 'The reset must check for an occupied port, verify the temporary server, and verify the restored service process.'
+    -not $powerShellSource.Contains('-ServiceProcessId $serviceProcessIds[0]')) {
+    throw 'The reset must check for an occupied port and verify both temporary and restored service processes.'
+}
+
+$temporaryReadinessStart = $powerShellSource.IndexOf('$startupTimeoutSeconds = 120')
+if ($temporaryReadinessStart -lt 0) {
+    throw 'Temporary MySQL readiness must use a bounded startup timeout.'
+}
+$temporaryReadinessEnd = $powerShellSource.IndexOf('if (-not $ready) {', $temporaryReadinessStart)
+if ($temporaryReadinessEnd -le $temporaryReadinessStart) {
+    throw 'Temporary MySQL readiness must use a bounded startup timeout.'
+}
+$temporaryReadinessBlock = $powerShellSource.Substring(
+    $temporaryReadinessStart,
+    $temporaryReadinessEnd - $temporaryReadinessStart
+)
+if ($temporaryReadinessBlock -notmatch '\$portWasOpened = \$true' -or
+    $temporaryReadinessBlock -notmatch 'Waiting for temporary MySQL to open port' -or
+    $temporaryReadinessBlock -notmatch 'has not accepted the new password probe yet') {
+    throw 'Temporary MySQL readiness must report progress and track whether its TCP listener opened.'
 }
 
 if (-not $functions.ContainsKey('Get-MySqlServerArguments')) {
@@ -160,17 +178,18 @@ if ((& $defaultPortResolver) -ne 3306) {
 
 $temporaryServerGuard = [scriptblock]::Create($functions['Assert-MySqlTemporaryServerOwnsPort'].Extent.Text)
 . $temporaryServerGuard
+$script:tempProcessRecords = @()
 $temporaryServerExe = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'
 $temporaryInitFile = 'C:\ProgramData\MySQLPasswordReset\run_test\init.sql'
 $temporaryCommandLine = '"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe" --defaults-file="C:\ProgramData\MySQL\MySQL Server 8.0\my.ini" --init-file="C:/ProgramData/MySQLPasswordReset/run_test/init.sql"'
 $temporaryProcessTree = @(
     [pscustomobject]@{
         ProcessId = 6552; ParentProcessId = 1200
-        ExecutablePath = $temporaryServerExe; CommandLine = $temporaryCommandLine
+        ExecutablePath = $temporaryServerExe; CommandLine = $temporaryCommandLine; CreationDate = 'root-created'
     }
     [pscustomobject]@{
         ProcessId = 2952; ParentProcessId = 6552
-        ExecutablePath = $temporaryServerExe; CommandLine = $temporaryCommandLine
+        ExecutablePath = $temporaryServerExe; CommandLine = $temporaryCommandLine; CreationDate = 'child-created'
     }
 )
 $directTemporaryServerOwner = Assert-MySqlTemporaryServerOwnsPort -Port 3306 -ExpectedProcessId 6552 `
@@ -181,6 +200,10 @@ $temporaryChildServerOwner = Assert-MySqlTemporaryServerOwnsPort -Port 3306 -Exp
     -ListenerProcessIds @(2952) -Processes $temporaryProcessTree
 if (-not $directTemporaryServerOwner -or -not $temporaryChildServerOwner) {
     throw 'The launched mysqld process and its verified child must be accepted as the temporary server.'
+}
+$trackedTemporaryProcessIds = @($script:tempProcessRecords | Select-Object -ExpandProperty ProcessId)
+if ($trackedTemporaryProcessIds -notcontains 6552 -or $trackedTemporaryProcessIds -notcontains 2952) {
+    throw 'The verified temporary mysqld process tree must be tracked through cleanup.'
 }
 $temporaryServerStoppedAfterProbe = Assert-MySqlTemporaryServerOwnsPort -Port 3306 -ExpectedProcessId 6552 `
     -ExpectedExecutablePath $temporaryServerExe -InitFilePath $temporaryInitFile `
@@ -235,6 +258,169 @@ if (-not $wrongInitFileRejected) {
 }
 Write-Output 'PASS: direct and child mysqld owners are verified; unrelated owners are rejected.'
 
+if (-not $functions.ContainsKey('Get-MySqlTemporaryProcessesStillRunning') -or
+    -not $functions.ContainsKey('Wait-ForMySqlTemporaryProcessTreeExit')) {
+    throw 'The reset must wait for the verified temporary MySQL process tree to exit before service startup.'
+}
+$temporaryProcessIdentityTest = [scriptblock]::Create(
+    $functions['Get-MySqlTemporaryProcessesStillRunning'].Extent.Text +
+    @'
+$tracked = @([pscustomobject]@{
+    ProcessId = 2952
+    ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'
+    CreationDate = 'original-process'
+})
+$reusedPid = @([pscustomobject]@{
+    ProcessId = 2952
+    ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'
+    CreationDate = 'replacement-process'
+})
+$reusedPidCount = @(Get-MySqlTemporaryProcessesStillRunning -TrackedProcesses $tracked -Processes $reusedPid).Count
+$unverifiableIdentityRejected = $false
+try {
+    $unknownProcess = @([pscustomobject]@{
+        ProcessId = 2952
+        ExecutablePath = ''
+        CreationDate = ''
+    })
+    Get-MySqlTemporaryProcessesStillRunning -TrackedProcesses $tracked -Processes $unknownProcess
+} catch {
+    $unverifiableIdentityRejected = $_.Exception.Message -match 'Unable to verify the identity'
+}
+[pscustomobject]@{
+    ReusedPidCount = $reusedPidCount
+    UnverifiableIdentityRejected = $unverifiableIdentityRejected
+}
+'@
+)
+$temporaryProcessIdentityResult = & $temporaryProcessIdentityTest
+if ($temporaryProcessIdentityResult.ReusedPidCount -ne 0 -or
+    -not $temporaryProcessIdentityResult.UnverifiableIdentityRejected) {
+    throw 'A recycled or unverifiable PID must not be mistaken for the verified temporary mysqld process.'
+}
+
+$temporaryProcessTreeWaitTest = [scriptblock]::Create(
+    $functions['Get-MySqlTemporaryProcessesStillRunning'].Extent.Text +
+    "`n" +
+    $functions['Wait-ForMySqlTemporaryProcessTreeExit'].Extent.Text +
+    @'
+$script:tempProcessRecords = @(
+    [pscustomobject]@{ ProcessId = 6552; ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'; CreationDate = 'root-created'; Depth = 1 }
+    [pscustomobject]@{ ProcessId = 2952; ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'; CreationDate = 'child-created'; Depth = 0 }
+)
+$script:processSnapshotCount = 0
+function Get-CimInstance {
+    [CmdletBinding()]
+    param([string]$ClassName, [string]$Namespace, [string]$Filter)
+    $script:processSnapshotCount++
+    if ($script:processSnapshotCount -eq 1) {
+        return @([pscustomobject]@{
+            ProcessId = 2952
+            ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'
+            CreationDate = 'child-created'
+        })
+    }
+    return @()
+}
+function Start-Sleep {
+    param([int]$Seconds)
+}
+Wait-ForMySqlTemporaryProcessTreeExit -TimeoutSeconds 1
+[pscustomobject]@{ SnapshotCount = $script:processSnapshotCount }
+'@
+)
+$temporaryProcessTreeWaitResult = & $temporaryProcessTreeWaitTest
+if ($temporaryProcessTreeWaitResult.SnapshotCount -lt 2) {
+    throw 'Service startup must wait until verified temporary MySQL descendants exit.'
+}
+Write-Output 'PASS: service startup waits for verified temporary MySQL descendants to exit.'
+
+if ($functions['Stop-TemporaryMySqlProcess'].Extent.Text -notmatch 'Wait-ForMySqlTemporaryProcessTreeExit -TimeoutSeconds 20 -ForceStopOnTimeout' -or
+    -not $functions.ContainsKey('Stop-VerifiedMySqlTemporaryProcessTree')) {
+    throw 'Failure cleanup must force-stop only still-verified temporary MySQL processes after a bounded graceful-shutdown wait.'
+}
+Write-Output 'PASS: failure cleanup bounds graceful shutdown and targets only verified temporary processes.'
+if ($functions['Wait-ForMySqlTemporaryProcessTreeExit'].Extent.Text -notmatch 'Waiting for verified temporary mysqld process') {
+    throw 'The reset must report progress while waiting for temporary MySQL shutdown.'
+}
+if ($functions['Wait-ForMySqlTemporaryProcessTreeExit'].Extent.Text -notmatch 'if \(\$ForceStopOnTimeout\)' -or
+    $functions['Wait-ForMySqlTemporaryProcessTreeExit'].Extent.Text -notmatch 'Stop-VerifiedMySqlTemporaryProcessTree') {
+    throw 'The reset must force-stop the verified temporary process tree when graceful shutdown times out.'
+}
+
+$verifiedTemporaryProcessStopTest = [scriptblock]::Create(
+    $functions['Get-MySqlTemporaryProcessesStillRunning'].Extent.Text +
+    "`n" +
+    $functions['Stop-VerifiedMySqlTemporaryProcessTree'].Extent.Text +
+    @'
+$script:tempProcessRecords = @(
+    [pscustomobject]@{ ProcessId = 6552; ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'; CreationDate = 'root-created'; Depth = 1 }
+    [pscustomobject]@{ ProcessId = 5304; ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'; CreationDate = 'child-created'; Depth = 0 }
+)
+$script:simulatedProcesses = @(
+    [pscustomobject]@{ ProcessId = 6552; ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'; CreationDate = 'root-created' }
+    [pscustomobject]@{ ProcessId = 5304; ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'; CreationDate = 'child-created' }
+)
+$script:stoppedProcessIds = @()
+$script:finalWaitTimeout = 0
+function Get-CimInstance {
+    [CmdletBinding()]
+    param([string]$ClassName, [string]$Namespace, [string]$Filter)
+    return @($script:simulatedProcesses)
+}
+function Stop-Process {
+    [CmdletBinding()]
+    param([int]$Id, [switch]$Force)
+    $script:stoppedProcessIds += $Id
+}
+function Wait-ForMySqlTemporaryProcessTreeExit {
+    param([int]$TimeoutSeconds)
+    $script:finalWaitTimeout = $TimeoutSeconds
+}
+function Write-Log { param([string]$Message) }
+Stop-VerifiedMySqlTemporaryProcessTree
+$verifiedStops = @($script:stoppedProcessIds)
+$verifiedWait = $script:finalWaitTimeout
+
+$script:simulatedProcesses = @(
+    [pscustomobject]@{ ProcessId = 6552; ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'; CreationDate = 'root-created' }
+    [pscustomobject]@{ ProcessId = 5304; ExecutablePath = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe'; CreationDate = 'reused-pid' }
+)
+$script:stoppedProcessIds = @()
+Stop-VerifiedMySqlTemporaryProcessTree
+[pscustomobject]@{
+    VerifiedStops = $verifiedStops
+    VerifiedWait = $verifiedWait
+    ReusedPidStops = @($script:stoppedProcessIds)
+}
+'@
+)
+$verifiedTemporaryProcessStopResult = & $verifiedTemporaryProcessStopTest
+if (@($verifiedTemporaryProcessStopResult.VerifiedStops).Count -ne 2 -or
+    $verifiedTemporaryProcessStopResult.VerifiedStops[0] -ne 5304 -or
+    $verifiedTemporaryProcessStopResult.VerifiedStops[1] -ne 6552 -or
+    $verifiedTemporaryProcessStopResult.VerifiedWait -ne 20 -or
+    @($verifiedTemporaryProcessStopResult.ReusedPidStops).Count -ne 1 -or
+    $verifiedTemporaryProcessStopResult.ReusedPidStops[0] -ne 6552) {
+    throw 'Timed-out cleanup must stop verified temporary PIDs only and must not kill a recycled PID.'
+}
+Write-Output 'PASS: timed-out cleanup stops verified temporary mysqld PIDs and rejects recycled PIDs.'
+
+$step8Start = $powerShellSource.IndexOf('Write-Log "[INFO] Shutting down temporary mysqld cleanly..."')
+$step9Start = $powerShellSource.IndexOf('Write-Log "[INFO] Starting MySQL service')
+if ($step8Start -lt 0 -or $step9Start -le $step8Start -or
+    $powerShellSource.Substring($step8Start, $step9Start - $step8Start) -notmatch 'Wait-ForMySqlTemporaryProcessTreeExit -TimeoutSeconds 20 -ForceStopOnTimeout') {
+    throw 'The temporary MySQL process tree must be allowed a bounded shutdown period and force-stopped before Step 9 starts the service.'
+}
+$serviceStartupBlock = $powerShellSource.Substring($step9Start)
+if ($serviceStartupBlock.IndexOf('Wait-ForMySqlServicePort') -lt 0 -or
+    $serviceStartupBlock.IndexOf('Wait-ForMySqlServicePort') -gt $serviceStartupBlock.IndexOf('Invoke-MySqlAuthenticationProbe') -or
+    $serviceStartupBlock -notmatch 'MySQL client response: \$verificationOutput' -or
+    $serviceStartupBlock.IndexOf('Set-MySqlServiceDelayedAutoStart') -lt 0 -or
+    $serviceStartupBlock.IndexOf('Set-MySqlServiceDelayedAutoStart') -gt $serviceStartupBlock.IndexOf('Start-Service -Name $ServiceName')) {
+    throw 'Step 9 must configure delayed startup before starting the service and check the new password only after the listener is ready.'
+}
+
 $listenerQueryTest = [scriptblock]::Create(
     $functions['Get-MySqlListeningProcessIds'].Extent.Text +
     @'
@@ -284,6 +470,82 @@ if (-not $unrelatedServiceListenerRejected) {
     throw 'Post-reset login must reject a listener outside the selected Windows service process tree.'
 }
 Write-Output 'PASS: service-owned child mysqld listeners are accepted and unrelated listeners rejected.'
+
+if (-not $functions.ContainsKey('Wait-ForMySqlServicePort')) {
+    throw 'Step 9 must wait for the service-owned MySQL listener before verifying login.'
+}
+$servicePortReadinessTest = [scriptblock]::Create(
+    $functions['Test-MySqlProcessBelongsToService'].Extent.Text +
+    "`n" +
+    $functions['Assert-MySqlServiceOwnsPort'].Extent.Text +
+    "`n" +
+    $functions['Wait-ForMySqlServicePort'].Extent.Text +
+    @'
+$script:serviceListenerProbeCount = 0
+function Get-Service {
+    [CmdletBinding()]
+    param([string]$Name)
+    [pscustomobject]@{ Status = 'Running' }
+}
+function Get-MySqlListeningProcessIds {
+    param([int]$Port)
+    $script:serviceListenerProbeCount++
+    if ($script:serviceListenerProbeCount -eq 1) {
+        return @()
+    }
+    return @(2472)
+}
+function Get-CimInstance {
+    [CmdletBinding()]
+    param([string]$ClassName, [string]$Namespace, [string]$Filter)
+    return @(
+        [pscustomobject]@{ ProcessId = 2472; ParentProcessId = 17176 }
+        [pscustomobject]@{ ProcessId = 17176; ParentProcessId = 716 }
+    )
+}
+function Start-Sleep {
+    param([int]$Seconds)
+}
+Wait-ForMySqlServicePort -Port 3306 -ServiceName 'MySQL_80.0.46' -ServiceProcessId 17176 -TimeoutSeconds 1
+[pscustomobject]@{ ProbeCount = $script:serviceListenerProbeCount }
+'@
+)
+$servicePortReadinessResult = & $servicePortReadinessTest
+if ($servicePortReadinessResult.ProbeCount -lt 2) {
+    throw 'Step 9 must retry until MySQL opens its port under the selected service process.'
+}
+Write-Output 'PASS: service readiness retries until the selected service owns its MySQL port.'
+
+if (-not $functions.ContainsKey('Set-MySqlServiceDelayedAutoStart')) {
+    throw 'The reset must support setting the selected service to Automatic (Delayed Start).'
+}
+$delayedAutoStartTest = [scriptblock]::Create(
+    $functions['Set-MySqlServiceDelayedAutoStart'].Extent.Text +
+    @'
+$global:LASTEXITCODE = 0
+$global:serviceControlArguments = @()
+function sc.exe {
+    $global:serviceControlArguments = @($args)
+    $global:LASTEXITCODE = 0
+}
+function Get-ItemProperty {
+    param([string]$LiteralPath, [string[]]$Name, [string]$ErrorAction)
+    [pscustomobject]@{ Start = 2; DelayedAutoStart = 1 }
+}
+Set-MySqlServiceDelayedAutoStart -ServiceName 'MySQL_80.0.46'
+[pscustomobject]@{ Arguments = $global:serviceControlArguments }
+'@
+)
+$delayedAutoStartResult = & $delayedAutoStartTest
+if (@($delayedAutoStartResult.Arguments).Count -ne 4 -or
+    $delayedAutoStartResult.Arguments[0] -ne 'config' -or
+    $delayedAutoStartResult.Arguments[1] -ne 'MySQL_80.0.46' -or
+    $delayedAutoStartResult.Arguments[2] -ne 'start=' -or
+    $delayedAutoStartResult.Arguments[3] -ne 'delayed-auto') {
+    throw 'The delayed-start option must use the Windows service configuration command and verify the persisted setting.'
+}
+Write-Output 'PASS: delayed automatic startup is configured and checked without changing test services.'
+
 $invalidPortResolver = [scriptblock]::Create(
     $functions['Get-MySqlServerPort'].Extent.Text +
     "`nGet-MySqlServerPort -ConfigLines @('[mysqld]', 'port=70000')"
@@ -673,6 +935,7 @@ Write-Output 'PASS: built-in service accounts map to stable ACL SIDs.'
 Write-Output 'PASS: UAC handoff waits for the elevated process.'
 Write-Output 'PASS: pre-reset service state is tracked.'
 Write-Output 'PASS: non-admin staging and read-only preflight are available.'
+Write-Output 'PASS: temporary MySQL startup uses a bounded wait with phase-specific progress.'
 
 $nativeProbeFunction = $functions['Invoke-MySqlAuthenticationProbe']
 if (-not $nativeProbeFunction) {
@@ -773,6 +1036,8 @@ try {
     $resetUi.ProgressLog.BackColor -ne [System.Drawing.Color]::FromArgb(20, 27, 36) -or
         $resetUi.ServiceSelector.SelectedItem.Name -ne 'MySQL80' -or
         $resetUi.ServiceSelector.GetItemText($resetUi.ServiceSelector.SelectedItem) -ne 'MySQL80' -or
+        -not $resetUi.DelayedAutoStartCheckBox.Checked -or
+        $resetUi.DelayedAutoStartCheckBox.AccessibleName -ne 'Set MySQL service to Automatic (Delayed Start)' -or
         -not $resetUi.PasswordBox.UseSystemPasswordChar -or
         -not $resetUi.ConfirmPasswordBox.UseSystemPasswordChar -or
         -not $resetUi.ResultDetails.Multiline -or
@@ -801,6 +1066,7 @@ try {
     if (-not (Submit-MySqlResetForm -Ui $resetUi) -or
         -not $resetUi.State.Submitted -or
         $resetUi.State.ServiceName -ne 'MySQL80' -or
+    -not $resetUi.State.DelayedAutoStart -or
         $resetUi.State.SecurePassword.Length -ne 19 -or
         $resetUi.PasswordBox.Text -or
         $resetUi.ConfirmPasswordBox.Text) {
@@ -809,6 +1075,21 @@ try {
 } finally {
     if ($resetUi.State.SecurePassword) { $resetUi.State.SecurePassword.Dispose() }
     $resetUi.Form.Dispose()
+}
+
+$uncheckedDelayedStartUi = New-MySqlResetForm -ServiceNames @('MySQL80')
+try {
+    $uncheckedDelayedStartUi.DelayedAutoStartCheckBox.Checked = $false
+    $uncheckedDelayedStartUi.PasswordBox.Text = 'LocalTest!Password9'
+    $uncheckedDelayedStartUi.ConfirmPasswordBox.Text = 'LocalTest!Password9'
+    $uncheckedDelayedStartUi.ConfirmationCheckBox.Checked = $true
+    if (-not (Submit-MySqlResetForm -Ui $uncheckedDelayedStartUi) -or
+        $uncheckedDelayedStartUi.State.DelayedAutoStart) {
+        throw 'Users must be able to keep the selected service startup mode unchanged.'
+    }
+} finally {
+    if ($uncheckedDelayedStartUi.State.SecurePassword) { $uncheckedDelayedStartUi.State.SecurePassword.Dispose() }
+    $uncheckedDelayedStartUi.Form.Dispose()
 }
 
 $invalidResetUi = New-MySqlResetForm -ServiceNames @('MySQL80') -InitialServiceName 'MySQL80'

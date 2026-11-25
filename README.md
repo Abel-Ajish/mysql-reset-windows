@@ -85,9 +85,16 @@ and light themes. After the elevated reset window is displayed, its console is
 hidden so the window remains the primary interface.
 The selected service is stopped while the password is changed. After a
 successful reset, the script starts the service and verifies that the new
-password works, even if the service was stopped before the reset. If a reset
-fails, a service that was running beforehand is restored when possible; a
-service that was already stopped is left stopped.
+password works, even if the service was stopped before the reset. The reset
+window defaults to setting the selected service to **Automatic (Delayed Start)**;
+clear that option to keep its current startup mode. If a reset fails, a service
+that was running beforehand is restored when possible; a service that was
+already stopped is left stopped.
+After the temporary server's graceful shutdown is requested, the script waits
+up to 20 seconds; if it is still running, only the previously verified
+temporary MySQL process IDs are force-stopped before the service starts.
+Temporary server startup can take up to 120 seconds; the progress log says
+whether it is waiting for the listener or for the new-password check.
 
 The script writes its temporary init SQL into a unique per-run directory with
 restricted ACLs and removes the file after use. Passwords are never passed as
@@ -111,9 +118,12 @@ powershell.exe -NoProfile -File .\tests\mysql_reset.tests.ps1
 These checks cover embedded-script parsing, argument quoting, service
 selection (including the interactive service picker), updater release
 validation and safe file replacement, service-account ACL mapping, port
-parsing, password SQL generation, reset-form validation, compatibility
-fallback, console visibility ordering, dark/light theme toggling, UI progress
-logging, and visible result details. The read-only batch preflight and MySQL
+parsing, password SQL generation and post-reset login diagnostics, verified
+temporary-process cleanup, delayed service startup configuration, reset-form
+validation, temporary-server startup timing and diagnostics, compatibility
+fallback,
+console visibility ordering, dark/light theme toggling, UI progress logging,
+and visible result details. The read-only batch preflight and MySQL
 configuration validator should also be run on each target installation. The
 regression suite does not reset a production database.
 

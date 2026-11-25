@@ -61,10 +61,11 @@ $script:resetUiFallbackReason = $null
 $script:resetSecurePassword = $null
 $tempStarted = $false
 $script:tempProcess = $null
+$script:tempProcessRecords = @()
 $serviceStopped = $false
 $serviceWasRunning = $false
 $script:plainPass = $null
-$script:appVersion = "1.2.0"
+$script:appVersion = "1.2.1"
 $dbPort = 3306
 $svcAccount = $null
 
@@ -108,10 +109,8 @@ function Stop-TemporaryMySqlProcess {
     if ($script:tempProcess -and -not $script:tempProcess.HasExited) {
         Write-Log "[WARN] Stopping only the temporary mysqld process started by this run..."
         Stop-Process -Id $script:tempProcess.Id -Force -ErrorAction Stop
-        if (-not $script:tempProcess.WaitForExit(10000)) {
-            throw "Temporary mysqld.exe process $($script:tempProcess.Id) did not exit."
-        }
     }
+    Wait-ForMySqlTemporaryProcessTreeExit -TimeoutSeconds 20 -ForceStopOnTimeout
 }
 
 function Get-MySqlServerArguments {
@@ -185,6 +184,25 @@ function Get-MySqlServiceAccountPrincipal {
         '^(?:NT AUTHORITY\\LocalService|LocalService)$' { return '*S-1-5-19' }
         '^(?:NT AUTHORITY\\NetworkService|NetworkService)$' { return '*S-1-5-20' }
         default { return $ServiceAccount.Trim() }
+    }
+}
+
+function Set-MySqlServiceDelayedAutoStart {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+
+    $serviceRegistryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    $output = @(& sc.exe config $ServiceName start= delayed-auto 2>&1)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        $outputText = (@($output | ForEach-Object { [string]$_ }) -join " ").Trim()
+        throw "Could not set service '$ServiceName' to Automatic (Delayed Start): $outputText"
+    }
+
+    $startConfiguration = Get-ItemProperty -LiteralPath $serviceRegistryPath `
+        -Name @("Start", "DelayedAutoStart") -ErrorAction Stop
+    if ([int]$startConfiguration.Start -ne 2 -or
+        [int]$startConfiguration.DelayedAutoStart -ne 1) {
+        throw "Windows did not persist Automatic (Delayed Start) for service '$ServiceName'."
     }
 }
 
@@ -301,6 +319,7 @@ function Assert-MySqlTemporaryServerOwnsPort {
     }
 
     $currentProcessId = [int]$ownerIds[0]
+    $verifiedAncestry = New-Object System.Collections.Generic.List[object]
     $ancestry = New-Object System.Collections.Generic.List[int]
     for ($depth = 0; $depth -lt 32 -and $currentProcessId -gt 0; $depth++) {
         $ancestry.Add($currentProcessId)
@@ -310,13 +329,151 @@ function Assert-MySqlTemporaryServerOwnsPort {
             -not [string]::Equals([IO.Path]::GetFullPath([string]$currentProcess[0].ExecutablePath), $expectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
             break
         }
+        $verifiedAncestry.Add([pscustomobject]@{
+            ProcessId = [int]$currentProcess[0].ProcessId
+            ExecutablePath = [string]$currentProcess[0].ExecutablePath
+            CreationDate = [string]$currentProcess[0].CreationDate
+            Depth = $depth
+        })
         if ($currentProcessId -eq $ExpectedProcessId) {
+            $verifiedIds = @($verifiedAncestry | Select-Object -ExpandProperty ProcessId)
+            $updatedRecords = New-Object System.Collections.Generic.List[object]
+            foreach ($record in $script:tempProcessRecords) {
+                if ($verifiedIds -notcontains $record.ProcessId) {
+                    $updatedRecords.Add($record)
+                }
+            }
+            foreach ($record in $verifiedAncestry) {
+                $updatedRecords.Add($record)
+            }
+            $script:tempProcessRecords = @($updatedRecords.ToArray())
             return $true
         }
         $currentProcessId = [int]$currentProcess[0].ParentProcessId
     }
 
     throw "MySQL port $Port owner PID $($ownerIds[0]) has ancestry $($ancestry -join ' -> '), which does not match the launched temporary server PID $ExpectedProcessId."
+}
+
+function Get-MySqlTemporaryProcessesStillRunning {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$TrackedProcesses,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Processes
+    )
+
+    $running = New-Object System.Collections.Generic.List[object]
+    foreach ($trackedProcess in $TrackedProcesses) {
+        $currentProcess = @($Processes | Where-Object { $_.ProcessId -eq $trackedProcess.ProcessId } | Select-Object -First 1)
+        if ($currentProcess.Count -ne 1) {
+            continue
+        }
+
+        $trackedCreationDate = [string]$trackedProcess.CreationDate
+        $currentCreationDate = [string]$currentProcess[0].CreationDate
+        if (-not [string]::IsNullOrWhiteSpace($trackedCreationDate) -and
+            -not [string]::IsNullOrWhiteSpace($currentCreationDate) -and
+            -not [string]::Equals($trackedCreationDate, $currentCreationDate, [StringComparison]::Ordinal)) {
+            continue
+        }
+
+        $currentExecutablePath = [string]$currentProcess[0].ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($currentExecutablePath)) {
+            if ([string]::IsNullOrWhiteSpace($trackedCreationDate) -or
+                [string]::IsNullOrWhiteSpace($currentCreationDate)) {
+                throw "Unable to verify the identity of temporary mysqld PID $($trackedProcess.ProcessId) while waiting for shutdown."
+            }
+        } elseif (-not [string]::Equals(
+            $currentExecutablePath,
+            [string]$trackedProcess.ExecutablePath,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            continue
+        }
+
+        $running.Add($trackedProcess)
+    }
+
+    return @($running.ToArray())
+}
+
+function Wait-ForMySqlTemporaryProcessTreeExit {
+    param(
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 20,
+        [switch]$ForceStopOnTimeout
+    )
+
+    $trackedProcesses = @($script:tempProcessRecords)
+    if ($trackedProcesses.Count -eq 0) {
+        return
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $nextProgressLog = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        $runningProcesses = @(Get-MySqlTemporaryProcessesStillRunning `
+            -TrackedProcesses $trackedProcesses `
+            -Processes $processes)
+        if ($runningProcesses.Count -eq 0) {
+            return
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            if ($ForceStopOnTimeout) {
+                Write-Log "[WARN] Graceful temporary MySQL shutdown timed out; force-stopping only verified temporary mysqld processes."
+                Stop-VerifiedMySqlTemporaryProcessTree
+                return
+            }
+            $processIds = @($runningProcesses | Select-Object -ExpandProperty ProcessId)
+            throw "Verified temporary mysqld process tree did not exit within $TimeoutSeconds seconds; remaining PID(s): $($processIds -join ', ')."
+        }
+        if ([DateTime]::UtcNow -ge $nextProgressLog) {
+            $processIds = @($runningProcesses | Select-Object -ExpandProperty ProcessId)
+            Write-Log "[INFO] Waiting for verified temporary mysqld process PID(s) $($processIds -join ', ') to exit."
+            $nextProgressLog = [DateTime]::UtcNow.AddSeconds(15)
+        }
+        Start-Sleep -Seconds 1
+    } while ($true)
+}
+
+function Stop-VerifiedMySqlTemporaryProcessTree {
+    $trackedProcesses = @($script:tempProcessRecords)
+    if ($trackedProcesses.Count -eq 0) {
+        return
+    }
+
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    $runningProcesses = @(Get-MySqlTemporaryProcessesStillRunning `
+        -TrackedProcesses $trackedProcesses `
+        -Processes $processes)
+    foreach ($trackedProcess in @($runningProcesses | Sort-Object -Property Depth)) {
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        $currentProcess = @($processes | Where-Object { $_.ProcessId -eq $trackedProcess.ProcessId } | Select-Object -First 1)
+        if ($currentProcess.Count -eq 0) {
+            continue
+        }
+
+        $trackedCreationDate = [string]$trackedProcess.CreationDate
+        $currentCreationDate = [string]$currentProcess[0].CreationDate
+        $currentExecutablePath = [string]$currentProcess[0].ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($trackedCreationDate) -or
+            [string]::IsNullOrWhiteSpace($currentCreationDate) -or
+            [string]::IsNullOrWhiteSpace($currentExecutablePath)) {
+            throw "Unable to verify the identity of temporary mysqld PID $($trackedProcess.ProcessId) before force-stopping it."
+        }
+        if (-not [string]::Equals($trackedCreationDate, $currentCreationDate, [StringComparison]::Ordinal) -or
+            -not [string]::Equals(
+                $currentExecutablePath,
+                [string]$trackedProcess.ExecutablePath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            continue
+        }
+
+        Write-Log "[WARN] Force-stopping verified temporary mysqld process PID $($trackedProcess.ProcessId)."
+        Stop-Process -Id ([int]$trackedProcess.ProcessId) -Force -ErrorAction Stop
+    }
+
+    Wait-ForMySqlTemporaryProcessTreeExit -TimeoutSeconds 20
 }
 
 function Test-MySqlProcessBelongsToService {
@@ -356,6 +513,39 @@ function Assert-MySqlServiceOwnsPort {
         -not (Test-MySqlProcessBelongsToService -ServiceProcessId $ServiceProcessId -ListenerProcessId $ownerIds[0] -Processes $Processes)) {
         throw "MySQL port $Port is owned by PID(s) $($ownerIds -join ', '), not owned by service PID $ServiceProcessId."
     }
+}
+
+function Wait-ForMySqlServicePort {
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [Parameter(Mandatory = $true)][int]$ServiceProcessId,
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 120
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $service = Get-Service -Name $ServiceName -ErrorAction Stop
+        if ($service.Status -ne 'Running') {
+            throw "MySQL service '$ServiceName' stopped before opening port $Port."
+        }
+
+        $listenerProcessIds = @(Get-MySqlListeningProcessIds -Port $Port)
+        if ($listenerProcessIds.Count -gt 0) {
+            $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+            Assert-MySqlServiceOwnsPort `
+                -Port $Port `
+                -ServiceProcessId $ServiceProcessId `
+                -ListenerProcessIds $listenerProcessIds `
+                -Processes $processes
+            return
+        }
+
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "MySQL service '$ServiceName' did not open port $Port within $TimeoutSeconds seconds."
+        }
+        Start-Sleep -Seconds 1
+    } while ($true)
 }
 
 function Resolve-MySqlServiceName {
@@ -872,6 +1062,7 @@ function Set-MySqlResetTheme {
         $input.ForeColor = $inputText
     }
     $Ui.ConfirmationCheckBox.ForeColor = $text
+    $Ui.DelayedAutoStartCheckBox.ForeColor = $text
     foreach ($button in @($Ui.CancelButton, $Ui.OpenLogButton)) {
         $button.BackColor = $inputBackground
         $button.ForeColor = $inputText
@@ -1009,10 +1200,18 @@ function New-MySqlResetForm {
     $confirmationCheckBox.AccessibleName = "Confirm password reset"
     $form.Controls.Add($confirmationCheckBox)
 
+    $delayedAutoStartCheckBox = New-Object System.Windows.Forms.CheckBox
+    $delayedAutoStartCheckBox.Text = "Set the selected service to Automatic (Delayed Start)"
+    $delayedAutoStartCheckBox.Checked = $true
+    $delayedAutoStartCheckBox.Location = New-Object System.Drawing.Point(28, 337)
+    $delayedAutoStartCheckBox.Size = New-Object System.Drawing.Size(644, 24)
+    $delayedAutoStartCheckBox.AccessibleName = "Set MySQL service to Automatic (Delayed Start)"
+    $form.Controls.Add($delayedAutoStartCheckBox)
+
     $resetButton = New-Object System.Windows.Forms.Button
     $resetButton.Text = "Reset password"
     $resetButton.Size = New-Object System.Drawing.Size(155, 38)
-    $resetButton.Location = New-Object System.Drawing.Point(517, 350)
+    $resetButton.Location = New-Object System.Drawing.Point(517, 366)
     $resetButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     $resetButton.FlatAppearance.BorderSize = 0
     $resetButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 115)
@@ -1024,7 +1223,7 @@ function New-MySqlResetForm {
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.Text = "Cancel"
     $cancelButton.Size = New-Object System.Drawing.Size(96, 38)
-    $cancelButton.Location = New-Object System.Drawing.Point(411, 350)
+    $cancelButton.Location = New-Object System.Drawing.Point(411, 366)
     $cancelButton.AccessibleName = "Cancel or close password reset"
     $form.Controls.Add($cancelButton)
     $form.CancelButton = $cancelButton
@@ -1032,14 +1231,14 @@ function New-MySqlResetForm {
     $openLogButton = New-Object System.Windows.Forms.Button
     $openLogButton.Text = "Open reset log"
     $openLogButton.Size = New-Object System.Drawing.Size(124, 38)
-    $openLogButton.Location = New-Object System.Drawing.Point(28, 350)
+    $openLogButton.Location = New-Object System.Drawing.Point(28, 366)
     $openLogButton.Enabled = $false
     $openLogButton.AccessibleName = "Open reset log in Notepad"
     $form.Controls.Add($openLogButton)
 
     $statusLabel = New-Object System.Windows.Forms.Label
     $statusLabel.Text = "Ready. Enter and confirm a password, then confirm the reset."
-    $statusLabel.Location = New-Object System.Drawing.Point(28, 405)
+    $statusLabel.Location = New-Object System.Drawing.Point(28, 410)
     $statusLabel.Size = New-Object System.Drawing.Size(644, 26)
     $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 105, 100)
     $statusLabel.AutoEllipsis = $true
@@ -1047,7 +1246,7 @@ function New-MySqlResetForm {
     $form.Controls.Add($statusLabel)
 
     $resultLabel = New-Object System.Windows.Forms.Label
-    $resultLabel.Location = New-Object System.Drawing.Point(28, 435)
+    $resultLabel.Location = New-Object System.Drawing.Point(28, 440)
     $resultLabel.Size = New-Object System.Drawing.Size(644, 25)
     $resultLabel.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
     $resultLabel.Visible = $false
@@ -1055,7 +1254,7 @@ function New-MySqlResetForm {
     $form.Controls.Add($resultLabel)
 
     $resultDetails = New-Object System.Windows.Forms.TextBox
-    $resultDetails.Location = New-Object System.Drawing.Point(28, 461)
+    $resultDetails.Location = New-Object System.Drawing.Point(28, 466)
     $resultDetails.Size = New-Object System.Drawing.Size(644, 56)
     $resultDetails.Multiline = $true
     $resultDetails.ReadOnly = $true
@@ -1068,14 +1267,14 @@ function New-MySqlResetForm {
     $form.Controls.Add($resultDetails)
 
     $progressBar = New-Object System.Windows.Forms.ProgressBar
-    $progressBar.Location = New-Object System.Drawing.Point(28, 520)
+    $progressBar.Location = New-Object System.Drawing.Point(28, 526)
     $progressBar.Size = New-Object System.Drawing.Size(644, 16)
     $progressBar.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
     $form.Controls.Add($progressBar)
 
     $progressLog = New-Object System.Windows.Forms.RichTextBox
-    $progressLog.Location = New-Object System.Drawing.Point(28, 548)
-    $progressLog.Size = New-Object System.Drawing.Size(644, 114)
+    $progressLog.Location = New-Object System.Drawing.Point(28, 552)
+    $progressLog.Size = New-Object System.Drawing.Size(644, 110)
     $progressLog.ReadOnly = $true
     $progressLog.WordWrap = $false
     $progressLog.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Both
@@ -1091,6 +1290,7 @@ function New-MySqlResetForm {
         Completed = $false
         ResultSuccess = $false
         ServiceName = $null
+        DelayedAutoStart = $true
         SecurePassword = $null
     }
     $ui = [pscustomobject]@{
@@ -1105,6 +1305,7 @@ function New-MySqlResetForm {
         PasswordBox = $passwordBox
         ConfirmPasswordBox = $confirmPasswordBox
         ConfirmationCheckBox = $confirmationCheckBox
+        DelayedAutoStartCheckBox = $delayedAutoStartCheckBox
         ResetButton = $resetButton
         CancelButton = $cancelButton
         OpenLogButton = $openLogButton
@@ -1201,10 +1402,12 @@ function Submit-MySqlResetForm {
     }
 
     $Ui.State.ServiceName = [string]$Ui.ServiceSelector.SelectedItem.Name
+    $Ui.State.DelayedAutoStart = [bool]$Ui.DelayedAutoStartCheckBox.Checked
     $Ui.State.Submitted = $true
     $Ui.State.InProgress = $true
     $Ui.ServiceSelector.Enabled = $false
     $Ui.ConfirmationCheckBox.Enabled = $false
+    $Ui.DelayedAutoStartCheckBox.Enabled = $false
     $Ui.ResetButton.Enabled = $false
     $Ui.CancelButton.Enabled = $false
     $Ui.Form.AcceptButton = $null
@@ -1387,9 +1590,9 @@ function Fail-WithReport {
     if ($tempStarted) {
         try {
             Stop-TemporaryMySqlProcess
-            Write-Host "  - [OK] Stopped temporary mysqld.exe process."
+            Write-Host "  - [OK] Stopped temporary mysqld process tree."
         } catch {
-            Write-Host "  - [WARN] Temporary mysqld.exe may still be running. Check Task Manager." -ForegroundColor Yellow
+            Write-Host "  - [WARN] Verified temporary mysqld process tree may still be active; do not start the service until it exits." -ForegroundColor Yellow
         }
     }
 
@@ -1786,14 +1989,24 @@ try {
     $tempStarted = $true
 
     $ready = $false
+    $portWasOpened = $false
     $lastProbeOutput = ""
-    for ($i = 0; $i -lt 35; $i++) {
+    $startupTimeoutSeconds = 120
+    for ($i = 0; $i -lt $startupTimeoutSeconds; $i++) {
         Start-Sleep -Seconds 1
+        if (($i + 1) % 15 -eq 0) {
+            if ($portWasOpened) {
+                Write-Log "[INFO] Temporary MySQL is listening but has not accepted the new password probe yet ($($i + 1)s elapsed)."
+            } else {
+                Write-Log "[INFO] Waiting for temporary MySQL to open port $dbPort ($($i + 1)s elapsed)."
+            }
+        }
         if ($script:tempProcess.HasExited) {
             throw "Temporary mysqld.exe exited unexpectedly during startup."
         }
         $listenerProcessIds = @(Get-MySqlListeningProcessIds -Port $dbPort)
         if ($listenerProcessIds.Count -gt 0) {
+            $portWasOpened = $true
             $null = Assert-MySqlTemporaryServerOwnsPort `
                 -Port $dbPort `
                 -ExpectedProcessId $script:tempProcess.Id `
@@ -1816,7 +2029,11 @@ try {
     }
 
     if (-not $ready) {
-        $timeoutReason = "Timed out waiting for temporary mysqld on port $dbPort to accept the new password."
+        if ($portWasOpened) {
+            $timeoutReason = "Timed out waiting for temporary mysqld on port $dbPort to accept the new password after $startupTimeoutSeconds seconds."
+        } else {
+            $timeoutReason = "Temporary mysqld did not open port $dbPort within $startupTimeoutSeconds seconds."
+        }
         if ($lastProbeOutput) {
             if ($lastProbeOutput.Length -gt 300) {
                 $lastProbeOutput = $lastProbeOutput.Substring(0, 300)
@@ -1858,9 +2075,7 @@ try {
         if ($shutdownRc -ne 0) {
             throw "mysqladmin shutdown failed with exit code $shutdownRc."
         }
-        if (-not $script:tempProcess.WaitForExit(20000)) {
-            throw "Temporary mysqld.exe process $($script:tempProcess.Id) did not shut down within 20 seconds."
-        }
+        Wait-ForMySqlTemporaryProcessTreeExit -TimeoutSeconds 20 -ForceStopOnTimeout
     } else {
         Write-Log "[INFO] Temporary MySQL had already stopped after the successful password check."
         Stop-TemporaryMySqlProcess
@@ -1872,11 +2087,16 @@ try {
     Remove-Item -LiteralPath $initFile -Force -ErrorAction Stop
     Write-Log "[OK] Wiped and deleted init SQL file."
 } catch {
-    Fail-WithReport -Step "Step 8: Shutdown Temporary Instance & Cleanup" -ExitCode 1 -Reason $_.Exception.Message -Fix "Stop mysqld.exe processes, delete '$initFile', and start '$ServiceName'."
+    Fail-WithReport -Step "Step 8: Shutdown Temporary Instance & Cleanup" -ExitCode 1 -Reason $_.Exception.Message -Fix "Review the MySQL error and audit logs. Only the identity-verified temporary mysqld process tree is force-stopped after the graceful shutdown timeout; unrelated mysqld.exe processes are never targeted."
 }
 
 try {
     Write-Log "[INFO] Starting MySQL service '$ServiceName' and verifying the new password..."
+    if ($script:resetUi -and $script:resetUi.State.DelayedAutoStart) {
+        Write-Log "[INFO] Setting service '$ServiceName' to Automatic (Delayed Start)..."
+        Set-MySqlServiceDelayedAutoStart -ServiceName $ServiceName
+        Write-Log "[OK] Service '$ServiceName' is configured for Automatic (Delayed Start)."
+    }
     Start-Service -Name $ServiceName -ErrorAction Stop
     (Get-Service -Name $ServiceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
     $serviceStopped = $false
@@ -1885,16 +2105,25 @@ try {
     if ($serviceProcessIds.Count -ne 1 -or $serviceProcessIds[0] -le 0) {
         throw "Could not verify the process hosting MySQL service '$ServiceName'."
     }
-    $listenerProcessIds = @(Get-MySqlListeningProcessIds -Port $dbPort)
-    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
-    Assert-MySqlServiceOwnsPort -Port $dbPort -ServiceProcessId $serviceProcessIds[0] -ListenerProcessIds $listenerProcessIds -Processes $processes
+    Wait-ForMySqlServicePort `
+        -Port $dbPort `
+        -ServiceName $ServiceName `
+        -ServiceProcessId $serviceProcessIds[0]
 
-    $env:MYSQL_PWD = $script:plainPass
-    & $mysqlExe -h 127.0.0.1 -P $dbPort -u root -e "SELECT USER(), VERSION();" >> $logFile 2>&1
-    $verRc = $LASTEXITCODE
-    $env:MYSQL_PWD = $null
-    if ($verRc -ne 0) {
-        throw "Service '$ServiceName' started, but post-reset login check failed with exit code $verRc."
+    $serviceProbeResult = Invoke-MySqlAuthenticationProbe `
+        -MySqlExe $mysqlExe `
+        -Arguments @("-h", "127.0.0.1", "-P", [string]$dbPort, "-u", "root", "-e", "SELECT 1;") `
+        -Password $script:plainPass
+    if ($serviceProbeResult.ExitCode -ne 0) {
+        $verificationOutput = $serviceProbeResult.Output
+        if ($verificationOutput.Length -gt 300) {
+            $verificationOutput = $verificationOutput.Substring(0, 300)
+        }
+        $verificationReason = "Service '$ServiceName' started, but post-reset login check failed with exit code $($serviceProbeResult.ExitCode)."
+        if ($verificationOutput) {
+            $verificationReason += " MySQL client response: $verificationOutput"
+        }
+        throw $verificationReason
     }
     $script:plainPass = $null
 

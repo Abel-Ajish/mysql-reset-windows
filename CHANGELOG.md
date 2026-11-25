@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+## 1.2.1 - 2026-11-25
+
+### Added
+
+- An optional reset-window setting, enabled by default, that configures the
+  selected Windows service for Automatic (Delayed Start).
+
+### Fixed
+
+- Bound temporary MySQL shutdown to a 20-second graceful wait, then
+  force-stop only processes whose PID, executable path, and creation time still
+  match the recorded temporary server; unrelated MySQL processes are untouched.
+- Wait for the selected service to own the MySQL listening port before checking
+  the new password, since Windows can report the service running before MySQL
+  is ready to accept connections.
+- Reuse the retry-safe MySQL authentication probe for the final password check
+  and show the MySQL client response when that check fails.
+- Allow up to 120 seconds for the temporary MySQL server to become ready, show
+  progress while waiting, and distinguish a server that never opened its port
+  from one that rejected the new-password probe.
+
 ## 1.2.0 - 2026-11-25
 
 ### Added
